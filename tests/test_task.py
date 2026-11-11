@@ -705,3 +705,147 @@ class TestResultDep(DepManagerMixin, unittest.TestCase):
                          self.dep_manager.get_status(
                              tasks['t1'], tasks).status)
 
+
+
+class FakeClock:
+    """controllable monotonic clock for timeout tests (no real sleeping)"""
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
+class TestTaskTimeout(unittest.TestCase):
+    def test_timeout_attr_defaults_to_none(self):
+        t = task.Task("taskX", None)
+        self.assertIsNone(t.timeout)
+
+    def test_timeout_accepts_seconds(self):
+        t = task.Task("taskX", None, timeout=5)
+        self.assertEqual(5.0, t.timeout)
+
+    def test_timeout_accepts_timedelta(self):
+        import datetime
+        t = task.Task("taskX", None, timeout=datetime.timedelta(seconds=2))
+        self.assertEqual(2.0, t.timeout)
+
+    def test_timeout_invalid_type(self):
+        self.assertRaises(task.InvalidTask, task.Task,
+                          "taskX", None, timeout="abc")
+
+    def test_timeout_must_be_positive(self):
+        self.assertRaises(task.InvalidTask, task.Task,
+                          "taskX", None, timeout=0)
+        self.assertRaises(task.InvalidTask, task.Task,
+                          "taskX", None, timeout=-1)
+
+    def test_timeout_rejects_python_action_before_running(self):
+        called = []
+        def would_block():
+            called.append(True)
+        t = task.Task("taskX", [would_block], timeout=5)
+        got = t.execute(Stream(0))
+        self.assertIsInstance(got, TaskError)
+        self.assertIn("timeout", got.message)
+        # callable was never started
+        self.assertEqual([], called)
+
+    def test_timeout_expires_between_actions(self):
+        # fake clock: deadline reached right after first action
+        clock = FakeClock()
+        ran = []
+
+        class FastAction(action.BaseAction):
+            def execute(self, out=None, err=None, timeout=None):
+                ran.append(timeout)
+                clock.advance(10.0)
+                self.out = ''
+                self.err = ''
+                self.result = None
+                self.values = {}
+
+        t = task.Task("taskX", None, timeout=5)
+        t._action_instances = [FastAction(), FastAction()]
+        got = t.execute(Stream(0), clock=clock)
+        self.assertIsInstance(got, task.TaskTimeout)
+        # first action ran with the remaining budget, second never started
+        self.assertEqual([5.0], ran)
+
+    def test_timeout_result_and_values_not_updated(self):
+        clock = FakeClock()
+        ran = []
+
+        class OkAction(action.BaseAction):
+            def __init__(self, idx):
+                self.idx = idx
+            def execute(self, out=None, err=None, timeout=None):
+                ran.append(self.idx)
+                clock.advance(10.0)
+                self.out = ''
+                self.err = ''
+                self.result = 'partial'
+                self.values = {'x': 1}
+
+        t = task.Task("taskX", None, timeout=5)
+        t._action_instances = [OkAction(1), OkAction(2)]
+        got = t.execute(Stream(0), clock=clock)
+        self.assertIsInstance(got, task.TaskTimeout)
+        # only the first action ran, remaining chain never started
+        self.assertEqual([1], ran)
+
+    def test_success_at_deadline_is_success(self):
+        # normal completion exactly when the deadline is reached must
+        # publish the final result exactly once (no timeout reported)
+        clock = FakeClock()
+
+        class OkAction(action.BaseAction):
+            def execute(self, out=None, err=None, timeout=None):
+                clock.advance(5.0)  # exactly the deadline
+                self.out = ''
+                self.err = ''
+                self.result = 'done'
+                self.values = {}
+
+        t = task.Task("taskX", None, timeout=5)
+        t._action_instances = [OkAction()]
+        got = t.execute(Stream(0), clock=clock)
+        self.assertIsNone(got)
+        self.assertEqual('done', t.result)
+
+    def test_timeout_passed_to_cmd_action(self):
+        clock = FakeClock()
+        received = []
+
+        class RecordingAction(action.BaseAction):
+            def execute(self, out=None, err=None, timeout=None):
+                received.append(timeout)
+                self.out = ''
+                self.err = ''
+                self.result = None
+                self.values = {}
+
+        t = task.Task("taskX", None, timeout=5)
+        t._action_instances = [RecordingAction()]
+        t.execute(Stream(0), clock=clock)
+        self.assertEqual([5.0], received)
+
+    def test_no_timeout_no_deadline(self):
+        received = []
+
+        class RecordingAction(action.BaseAction):
+            def execute(self, out=None, err=None, timeout=None):
+                received.append(timeout)
+                self.out = ''
+                self.err = ''
+                self.result = None
+                self.values = {}
+
+        t = task.Task("taskX", None)
+        t._action_instances = [RecordingAction()]
+        got = t.execute(Stream(0))
+        self.assertIsNone(got)
+        self.assertEqual([None], received)

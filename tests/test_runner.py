@@ -1,17 +1,20 @@
 import os
 import sys
 import pickle
+import shutil
+import tempfile
 import unittest
 from multiprocessing import Queue
 import platform
 from unittest.mock import Mock, patch
 
-from doit.exceptions import BaseFail, InvalidTask
+from doit.exceptions import BaseFail, InvalidTask, TaskTimeout
 from doit.dependency import DbmDB, Dependency
 from doit.reporter import ConsoleReporter
 from doit.task import Task, DelayedLoader
 from doit.control import TaskDispatcher, ExecNode
 from doit import runner
+from doit.action import CmdAction
 
 from tests.support import DepManagerMixin, DepfileNameMixin
 
@@ -547,6 +550,65 @@ class RunnerRunTasksBase:
         self.assertRaises(SystemExit, my_runner.run_tasks, disp)
         my_runner.finish()
 
+    # --- task timeout ---
+
+    def _make_timeout_tasks(self, tmpdir):
+        """t1 blocks forever (timeout), t2 depends on t1, t3 unrelated"""
+        ready_file = os.path.join(tmpdir, 'ready')
+        second_file = os.path.join(tmpdir, 'second')
+        program = "%s %s/sample_timeout_process.py" % (
+            sys.executable,
+            os.path.join(os.path.dirname(__file__), '..', 'tests'))
+        dep_file = os.path.join(tmpdir, 'input')
+        with open(dep_file, 'w') as fh:
+            fh.write('input')
+        t1 = Task("t1", ["%s block %s" % (program, ready_file)],
+                  file_dep=[dep_file], timeout=1.0)
+        t2 = Task("t2", ["%s quick %s" % (program, second_file)],
+                  task_dep=['t1'])
+        t3 = Task("t3", ["%s quick done" % program], file_dep=[dep_file])
+        return t1, t2, t3, ready_file, second_file
+
+    def test_timeout_terminal_state(self):
+        # same terminal state for all runners: timeout is a task failure,
+        # dependents are blocked, unrelated tasks still complete
+        tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
+        t1, t2, t3, ready_file, second_file = self._make_timeout_tasks(tmpdir)
+        reporter = FakeReporter(with_exceptions=True)
+        my_runner = self.runner_class(self.dep_manager, reporter,
+                                      continue_=True)
+        with patch.object(CmdAction, 'KILL_GRACE', 0.2):
+            my_runner.run_tasks(TaskDispatcher(
+                {'t1': t1, 't2': t2, 't3': t3}, [], ['t1', 't2', 't3']))
+        # t2's unmet dependency is a TaskError, same terminal state as
+        # a regular failure with dependents (see test_continue_*)
+        self.assertEqual(runner.ERROR, my_runner.finish())
+
+        # t1 timed out
+        self.assertEqual(('start', t1), reporter.log.pop(0))
+        self.assertEqual(('execute', t1), reporter.log.pop(0))
+        fail_log = reporter.log.pop(0)
+        self.assertEqual(('fail', t1), fail_log[:2])
+        self.assertIsInstance(fail_log[2], TaskTimeout)
+        # t2 depends on t1 so it can not run
+        self.assertEqual(('start', t2), reporter.log.pop(0))
+        self.assertEqual(('fail', t2), reporter.log.pop(0)[:2])
+        # unrelated t3 still completes
+        self.assertEqual(('start', t3), reporter.log.pop(0))
+        self.assertEqual(('execute', t3), reporter.log.pop(0))
+        self.assertEqual(('success', t3), reporter.log.pop(0))
+        self.assertEqual(0, len(reporter.log))
+
+        # controlled sub-process really exited
+        pid = int(open(ready_file).read())
+        self.assertRaises(ProcessLookupError, os.kill, pid, 0)
+        # t2's action never started
+        self.assertFalse(os.path.exists(second_file))
+        # captured output from before the timeout is preserved
+        self.assertEqual("before-timeout\n", t1.actions[0].out)
+        self.assertEqual("err-before-timeout\n", t1.actions[0].err)
+
 
 class TestRunnerRunTasks_Runner(RunnerRunTasksBase, DepManagerMixin,
                                 DepfileNameMixin, unittest.TestCase):
@@ -572,6 +634,36 @@ class TestRunnerRunTasks_Runner(RunnerRunTasksBase, DepManagerMixin,
         self.assertIn("Dependent file 'i_dont_exist' does not exist",
                        str(fail_log[2]))
         self.assertFalse(reporter.log)
+
+    def test_timeout_not_saved_reopen_db(self):
+        # after a timeout, reopening the dependency DB must show the
+        # task still needs to run (no success record persisted)
+        tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
+        t1, t2, t3, ready_file, second_file = \
+            self._make_timeout_tasks(tmpdir)
+        my_runner = runner.Runner(self.dep_manager, self.reporter,
+                                  continue_=True)
+        with patch.object(CmdAction, 'KILL_GRACE', 0.2):
+            my_runner.run_tasks(TaskDispatcher(
+                {'t1': t1, 't2': t2, 't3': t3}, [], ['t1', 't2', 't3']))
+        my_runner.finish()
+
+        depfile = self.dep_manager.name
+        dep_file = os.path.join(tmpdir, 'input')
+        reopened = Dependency(DbmDB, depfile)
+        try:
+            t1_again = Task("t1", None, file_dep=[dep_file])
+            status = reopened.get_status(t1_again, {'t1': t1_again})
+            self.assertEqual('run', status.status)
+            self.assertEqual({}, reopened.get_values('t1'))
+            self.assertIsNone(reopened.get_result('t1'))
+            # t3 succeeded and stays up-to-date
+            t3_again = Task("t3", None, file_dep=[dep_file])
+            t3_status = reopened.get_status(t3_again, {'t3': t3_again})
+            self.assertEqual('up-to-date', t3_status.status)
+        finally:
+            reopened.close()
 
 
 class TestRunnerRunTasks_MThread(RunnerRunTasksBase, DepManagerMixin,

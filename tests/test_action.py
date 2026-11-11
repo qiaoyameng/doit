@@ -1010,3 +1010,75 @@ class TestCreateAction(unittest.TestCase):
             action.create_action(True, self.mytask, 'clean')
         self.assertIn(expected, str(cm.exception))
 
+
+
+TIMEOUT_PROGRAM = "%s %s/sample_timeout_process.py" % (
+    executable, TEST_PATH)
+
+
+class TestCmdActionTimeout(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = os.path.realpath(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmpdir)
+        self.ready_file = os.path.join(self.tmpdir, 'ready')
+        self.action = action.CmdAction(
+            "%s block %s" % (TIMEOUT_PROGRAM, self.ready_file))
+
+    def _wait_ready(self):
+        # the controlled process signals readiness through a file, so no
+        # long sleep is needed to know it started
+        for _ in range(100):
+            if os.path.exists(self.ready_file):
+                return
+            time.sleep(0.02)
+        self.fail("controlled process never became ready")
+
+    def test_timeout_kills_process_and_keeps_output(self):
+        with unittest.mock.patch.object(action.CmdAction, 'KILL_GRACE', 0.2):
+            got = self.action.execute(timeout=1.0)
+        self.assertIsInstance(got, action.TaskTimeout)
+        self.assertIn("timed out", got.message)
+        # process really terminated
+        pid = int(open(self.ready_file).read())
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pid, 0)
+        # output produced before the timeout is preserved
+        self.assertEqual("before-timeout\n", self.action.out)
+        self.assertEqual("err-before-timeout\n", self.action.err)
+        # no success result / values are published on timeout
+        self.assertIsNone(self.action.result)
+        self.assertEqual({}, self.action.values)
+
+    def test_timeout_kills_child_processes(self):
+        child_action = action.CmdAction(
+            "%s child %s" % (TIMEOUT_PROGRAM, self.ready_file))
+        with unittest.mock.patch.object(action.CmdAction, 'KILL_GRACE', 0.2):
+            got = child_action.execute(timeout=1.0)
+        self.assertIsInstance(got, action.TaskTimeout)
+        pids = open(self.ready_file).read().split(':')
+        for pid in pids:
+            with self.assertRaises(ProcessLookupError):
+                os.kill(int(pid), 0)
+
+    def test_no_timeout_still_works(self):
+        quick = action.CmdAction("%s quick done" % TIMEOUT_PROGRAM)
+        self.assertIsNone(quick.execute(timeout=5.0))
+        self.assertEqual("done", quick.result)
+
+    def test_quick_finish_beats_deadline(self):
+        # completion exactly within the deadline must not be a timeout
+        quick = action.CmdAction("%s quick done" % TIMEOUT_PROGRAM)
+        self.assertIsNone(quick.execute(timeout=30.0))
+
+
+class TestPythonActionTimeout(unittest.TestCase):
+    def test_timeout_refused_before_running_callable(self):
+        called = []
+        def would_block():
+            called.append(True)
+        my_action = action.PythonAction(would_block)
+        got = my_action.execute(timeout=5.0)
+        self.assertIsInstance(got, TaskError)
+        self.assertIn("timeout", got.message)
+        # callable never started, so nothing can keep writing files
+        self.assertEqual([], called)

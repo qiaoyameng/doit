@@ -3,15 +3,17 @@
 
 import os
 import sys
+import signal
 import subprocess
 import io
 from io import StringIO
 import inspect
+import time
 from pathlib import PurePath
 from threading import Thread
 import pdb
 
-from .exceptions import InvalidTask, TaskFailed, TaskError
+from .exceptions import InvalidTask, TaskFailed, TaskError, TaskTimeout
 
 
 def normalize_callable(ref):
@@ -119,6 +121,11 @@ class CmdAction(BaseAction):
 
     STRING_FORMAT = 'old'
 
+    # grace period between SIGTERM and SIGKILL on timeout
+    KILL_GRACE = 1.0
+    # how often the timeout deadline is checked while the process runs
+    POLL_INTERVAL = 0.1
+
     def __init__(self, action, task=None, save_out=None, shell=True,
                  encoding='utf-8', decode_error='replace', buffering=0,
                  **pkwargs):  # pylint: disable=W0231
@@ -182,7 +189,7 @@ class CmdAction(BaseAction):
                 realtime.flush()  # required if on byte buffering mode
 
 
-    def execute(self, out=None, err=None):
+    def execute(self, out=None, err=None, timeout=None):
         """
         Execute command action
 
@@ -191,11 +198,16 @@ class CmdAction(BaseAction):
         @param out: None - no real time output
                     a file like object (has write method)
         @param err: idem
+        @param timeout: (float/int or None) max wall-clock seconds this
+                    action is allowed to run, measured from the moment the
+                    sub-process is spawned. On expiry the whole process
+                    group is terminated and a TaskTimeout is returned.
         @return failure:
             - None: if successful
             - TaskError: If subprocess return code is greater than 125
             - TaskFailed: If subprocess return code isn't zero (and
         not greater than 125)
+            - TaskTimeout: If the action exceeded `timeout`
         """
         try:
             action = self.expand_action()
@@ -213,6 +225,11 @@ class CmdAction(BaseAction):
             if not env:
                 env = os.environ.copy()
             env['PYTHONUNBUFFERED'] = '1'
+
+        # on timeout the process must be killed together with all of its
+        # children, so put it in its own process group/session.
+        if timeout is not None and os.name == 'posix':
+            subprocess_pkwargs.setdefault('start_new_session', True)
 
         capture_io = self.task.io.capture if self.task else True
         if capture_io:
@@ -243,15 +260,29 @@ class CmdAction(BaseAction):
                            args=(process, process.stderr, errput, err))
             t_out.start()
             t_err.start()
+        else:
+            output = errput = None
+            t_out = t_err = None
+
+        timed_out = self._wait_process(process, timeout)
+
+        if capture_io:
             t_out.join()
             t_err.join()
-
+            # keep everything produced before the timeout, do not publish
+            # a success result though
             self.out = output.getvalue()
             self.err = errput.getvalue()
-            self.result = self.out + self.err
+            if not timed_out:
+                self.result = self.out + self.err
 
         # make sure process really terminated
         process.wait()
+
+        if timed_out:
+            return TaskTimeout(
+                "Command timed out after %s seconds: '%s'" %
+                (timeout, action))
 
         # task error - based on:
         # http://www.gnu.org/software/bash/manual/bashref.html#Exit-Status
@@ -268,6 +299,57 @@ class CmdAction(BaseAction):
         # save stdout in values
         if self.save_out:
             self.values[self.save_out] = self.out
+
+    def _wait_process(self, process, timeout):
+        """wait for `process` to finish, enforcing `timeout`.
+
+        On timeout terminate the process and all of its children.
+        @return True if the timeout was reached, False otherwise
+        """
+        if timeout is None:
+            process.wait()
+            return False
+
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    if process.poll() is not None:
+                        # process finished right at the deadline
+                        return False
+                    self._terminate_process(process)
+                    return True
+                process.wait(timeout=min(remaining, self.POLL_INTERVAL))
+                return False
+            except subprocess.TimeoutExpired:
+                if process.poll() is not None:
+                    return False
+
+    def _terminate_process(self, process):
+        """terminate `process` together with all of its child processes"""
+        if process.poll() is not None:
+            return
+        try:
+            if os.name == 'posix':
+                # negative pid signals the whole process group created
+                # through start_new_session=True
+                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+            else:  # pragma: no cover - non-posix platforms
+                process.terminate()
+        except (ProcessLookupError, PermissionError):
+            return
+        try:
+            process.wait(timeout=self.KILL_GRACE)
+        except subprocess.TimeoutExpired:
+            try:
+                if os.name == 'posix':
+                    os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                else:  # pragma: no cover
+                    process.kill()
+            except (ProcessLookupError, PermissionError):
+                pass
+        process.wait()
 
 
     def expand_action(self):
@@ -426,7 +508,7 @@ class PythonAction(BaseAction):
         return BaseAction._prepare_kwargs(self.task, self.py_callable,
                                           self.args, self.kwargs)
 
-    def execute(self, out=None, err=None):
+    def execute(self, out=None, err=None, timeout=None):
         """Execute command action
 
         both stdout and stderr from the command are captured and saved
@@ -434,9 +516,19 @@ class PythonAction(BaseAction):
         @param out: None - no real time output
                     a file like object (has write method)
         @param err: idem
+        @param timeout: not supported. A python callable runs in-process
+                    and can not be safely interrupted, so it is refused
+                    instead of leaving the callable running after a
+                    timeout is reported.
 
         @return failure: see CmdAction.execute
         """
+        if timeout is not None:
+            return TaskError(
+                "PythonAction does not support 'timeout'. A python callable "
+                "executed in-process can not be safely interrupted. "
+                "Use a CmdAction so the command runs on its own process.")
+
         capture_io = self.task.io.capture if self.task else True
 
         if capture_io:

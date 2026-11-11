@@ -3,13 +3,15 @@
 
 import os
 import sys
+import time
 import inspect
+import datetime
 from collections import OrderedDict
 from collections.abc import Callable
 from pathlib import PurePath
 
 from .cmdparse import CmdOption, TaskParse
-from .exceptions import BaseFail, InvalidTask
+from .exceptions import BaseFail, InvalidTask, TaskError, TaskTimeout
 from .action import create_action, PythonAction
 from .dependency import UptodateCalculator
 
@@ -129,6 +131,10 @@ class Task:
     @ivar has_subtask: (bool) indicate this task has subtasks
     @ivar result: (str) last action "result". used to check task-result-dep
     @ivar values: (dict) values saved by task that might be used by other tasks
+    @ivar timeout: (float/int/datetime.timedelta or None) maximum time in
+         seconds the whole action chain is allowed to run. The clock starts
+         when the task execution starts (time spent waiting on the queue
+         does not count). Only cmd-actions can be interrupted on timeout.
     @ivar getargs: (dict) values from other tasks
     @ivar doc: (string) task documentation
     @ivar meta: (dict) extra info from user/plugin not directly used by doit
@@ -164,7 +170,8 @@ class Task:
                   'getargs': ((dict,), ()),
                   'title': ((Callable,), (None,)),
                   'watch': ((list, tuple), ()),
-                  'meta': ((dict,), (None,))
+                  'meta': ((dict,), (None,)),
+                  'timeout': ((int, float, datetime.timedelta), (None,))
                   }
 
 
@@ -174,10 +181,12 @@ class Task:
                  subtask_of=None, has_subtask=False,
                  doc=None, params=(), pos_arg=None,
                  verbosity=None, io=None, title=None, getargs=None,
-                 watch=(), meta=None, loader=None):
+                 watch=(), meta=None, loader=None, timeout=None):
         """sanity checks and initialization
 
         @param params: (list of dict for parameters) see cmdparse.CmdOption
+        @param timeout: (int/float/datetime.timedelta or None) maximum time
+               in seconds the whole action chain is allowed to run
         """
 
         getargs = getargs or {}  # default
@@ -200,6 +209,7 @@ class Task:
         self.check_attr(name, 'title', title, self.valid_attr['title'])
         self.check_attr(name, 'watch', watch, self.valid_attr['watch'])
         self.check_attr(name, 'meta', meta, self.valid_attr['meta'])
+        self.check_attr(name, 'timeout', timeout, self.valid_attr['timeout'])
 
         if '=' in name:
             msg = "Task '{}': name must not use the char '=' (equal sign)."
@@ -257,8 +267,21 @@ class Task:
         self.doc = self._init_doc(doc)
         self.watch = watch
         self.meta = meta
+        self.timeout = self._init_timeout(timeout)
         # just indicate if actions were executed at all
         self.executed = False
+
+
+    def _init_timeout(self, timeout):
+        """normalize timeout to seconds (float) or None"""
+        if timeout is None:
+            return None
+        if isinstance(timeout, datetime.timedelta):
+            timeout = timeout.total_seconds()
+        if timeout <= 0:
+            msg = "%s. timeout must be a positive number of seconds. Got %r"
+            raise InvalidTask(msg % (self.name, timeout))
+        return float(timeout)
 
 
     def _init_deps(self, file_dep, task_dep, calc_dep):
@@ -462,15 +485,51 @@ class Task:
     def overwrite_verbosity(self, stream):
         self.verbosity = stream.effective_verbosity(self.verbosity)
 
-    def execute(self, stream):
+    def execute(self, stream, clock=None):
         """Executes the task.
+
+        If `timeout` is set, a single deadline covers the whole action
+        chain and is measured from the moment this method starts
+        (monotonic clock), so time spent waiting for dependencies or in
+        the execution queue does not count. On expiry remaining actions
+        are not executed and a TaskTimeout is returned.
+
+        @param clock: callable returning a monotonic time in seconds
+               (defaults to time.monotonic; overridable in tests)
         @return failure: see CmdAction.execute
         """
         self.executed = True
         self.init_options()
         task_stdout, task_stderr = stream._get_out_err(self.verbosity)
+
+        if self.timeout is not None:
+            # a python callable can not be interrupted safely once running,
+            # so refuse this combination instead of faking a timeout while
+            # the callable keeps running and writing files.
+            for action in self.actions:
+                if isinstance(action, PythonAction):
+                    return TaskError(
+                        "Task '%s' sets a timeout but contains a "
+                        "python action. A python callable executed "
+                        "in-process can not be safely interrupted. Use "
+                        "a cmd-action instead." % self.name)
+
+        if clock is None:
+            clock = time.monotonic
+        deadline = None
+        if self.timeout is not None:
+            deadline = clock() + self.timeout
+
         for action in self.actions:
-            action_return = action.execute(task_stdout, task_stderr)
+            action_timeout = None
+            if deadline is not None:
+                action_timeout = deadline - clock()
+                if action_timeout <= 0:
+                    return TaskTimeout(
+                        "Task '%s' timed out after %s seconds" %
+                        (self.name, self.timeout))
+            action_return = action.execute(task_stdout, task_stderr,
+                                           timeout=action_timeout)
             if isinstance(action_return, BaseFail):
                 return action_return
             self.result = action.result

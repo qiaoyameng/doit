@@ -643,6 +643,34 @@ You can control the verbosity by:
 * from command line, see :ref:`verbosity option<verbosity_option>`.
 
 
+.. _timeout:
+
+
+timeout
+--------
+
+A task can define a ``timeout`` as a number of seconds or a
+``datetime.timedelta``. The timeout covers the whole action chain and is
+measured from the moment the task actually starts executing using a
+monotonic clock, so time spent waiting for dependencies or in the
+execution queue is not counted.
+
+When the deadline is reached the remaining actions are not executed and
+the task fails with a ``TaskTimeout`` failure. Nothing is saved on the
+dependency database (no success record, values or result), so the task
+is executed again on the next run and tasks depending on it are skipped.
+Other unrelated tasks keep running normally.
+
+Only *cmd-actions* can be interrupted: the command process and all of
+its child processes are terminated (SIGTERM followed by SIGKILL if
+needed), while stdout/stderr already produced are preserved on the
+action's ``out``/``err``. *python-actions* run in-process and cannot be
+safely interrupted, so a task containing a python action together with a
+``timeout`` is refused with an error before any callable is executed.
+
+.. literalinclude:: samples/task_timeout.py
+
+
 meta
 ----
 

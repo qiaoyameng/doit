@@ -95,6 +95,16 @@ class TaskError(BaseFail):
     pass
 
 
+class TaskTimeout(TaskFailed):
+    """Task execution exceeded its `timeout` attribute.
+
+    The task was interrupted, its remaining actions were not executed
+    and no success/values were saved, so the task will be executed
+    again on the next run.
+    """
+    pass
+
+
 class UnmetDependency(TaskError):
     """Task was not executed because a dependent task failed or is ignored"""
     pass

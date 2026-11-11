@@ -41,6 +41,23 @@ def get_file_md5(path):
     return md5.hexdigest()
 
 
+def get_file_sha256(path):
+    """Calculate the sha256 sum from file content.
+
+    @param path: (string) file path
+    @return: (string) sha256 hex digest
+    """
+    with open(path, 'rb') as file_data:
+        sha256 = hashlib.sha256()
+        block_size = 128 * sha256.block_size
+        while True:
+            data = file_data.read(block_size)
+            if not data:
+                break
+            sha256.update(data)
+    return sha256.hexdigest()
+
+
 class JSONCodec():
     """default implmentation for codec used to save individual task's data"""
     def __init__(self):
@@ -432,9 +449,95 @@ class TimestampChecker(FileChangedChecker):
         return os.path.getmtime(dep)
 
 
+class SHA256Checker(FileChangedChecker):
+    """SHA-256 checker, uses the sha256 sum of file content.
+
+    The saved state is a tuple ``(timestamp, size, sha256)``.
+
+    Two modes are available:
+
+    * normal mode (``strict=False``): like MD5Checker, if the timestamp is
+      unchanged the file is considered unmodified and its content is not
+      re-hashed.
+    * strict-content mode (``strict=True``): the content hash is always
+      verified, even if the timestamp did not change. This detects changes
+      missed by timestamp comparison, e.g. when a file is replaced by a copy
+      that preserves the original mtime (``cp -p``, ``rsync -t``).
+
+    Old states saved by MD5Checker have the same format but a 32-chars
+    digest. They are never trusted: the content is re-hashed once and the
+    state is migrated to sha256 on the next successful save.
+
+    Digests computed during a check are cached per file and re-used while
+    the file's (mtime, size) does not change, so repeated checks of the same
+    file within a run do not re-hash its content. On strict mode the cache
+    is not used: a file with a preserved mtime (e.g. a copy from ``cp -p``)
+    must always be verified against its actual content.
+    """
+
+    MD5_DIGEST_LEN = 32  # hexdigest length used by legacy MD5Checker states
+
+    def __init__(self, strict=False):
+        self.strict = strict
+        # (mtime, size) -> sha256 hexdigest, per file path
+        self._digest_cache = {}
+
+    def _get_digest(self, file_path, file_stat):
+        """Return sha256 of file content.
+
+        On non-strict mode a cached value is re-used while the file's
+        (mtime, size) is unchanged. Strict mode never uses the cache since
+        a mtime-preserving content change would not invalidate it.
+        """
+        if not self.strict:
+            stat_key = (file_stat.st_mtime, file_stat.st_size)
+            cached = self._digest_cache.get(file_path)
+            if cached is not None and cached[0] == stat_key:
+                return cached[1]
+            digest = get_file_sha256(file_path)
+            self._digest_cache[file_path] = (stat_key, digest)
+            return digest
+        return get_file_sha256(file_path)
+
+    def check_modified(self, file_path, file_stat, state):
+        """Check if file in file_path is modified from previous "state".
+        """
+        timestamp, size, file_sha256 = state
+
+        # legacy md5 state can not be compared with a sha256 digest:
+        # always consider it modified so the task runs once and its
+        # state is safely re-computed/migrated on the next save
+        if len(file_sha256) == self.MD5_DIGEST_LEN:
+            return True
+
+        # 1 - if timestamp is not modified file is the same, unless on
+        # strict mode where the content is always checked
+        if not self.strict and file_stat.st_mtime == timestamp:
+            return False
+
+        # 2 - if size is different file is modified
+        if file_stat.st_size != size:
+            return True
+
+        # 3 - check sha256 of content
+        return file_sha256 != self._get_digest(file_path, file_stat)
+
+    def get_state(self, dep, current_state):
+        timestamp = os.path.getmtime(dep)
+        size = os.path.getsize(dep)
+        # time optimization. if dep is already saved with current
+        # timestamp skip calculating sha256 (not on strict mode)
+        if current_state and current_state[0] == timestamp and not self.strict:
+            return
+        sha256 = self._get_digest(dep, os.stat(dep))
+        return timestamp, size, sha256
+
+
 # name of checkers class available
 CHECKERS = {'md5': MD5Checker,
-            'timestamp': TimestampChecker}
+            'timestamp': TimestampChecker,
+            'sha256': SHA256Checker,
+            'sha256_strict': SHA256Checker}
 
 
 class DependencyStatus:
@@ -501,7 +604,12 @@ class Dependency:
     def __init__(self, db_class, backend_name, checker_cls=MD5Checker,
                  codec_cls=JSONCodec, module_name=None):
         self._closed = False
-        self.checker = checker_cls()
+        if isinstance(checker_cls, tuple):
+            # (checker class, kwargs) e.g. (SHA256Checker, {'strict': True})
+            checker_cls, checker_kwargs = checker_cls
+            self.checker = checker_cls(**checker_kwargs)
+        else:
+            self.checker = checker_cls()
         self.db_class = db_class
         self.backend = db_class(backend_name, codec=codec_cls(), module_name=module_name)
         self._set = self.backend.set

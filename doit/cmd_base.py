@@ -240,6 +240,9 @@ opt_check_file_uptodate = {
 Choose how to check if files have been modified.
 Available options [default: %(default)s]:
   'md5': use the md5sum
+  'sha256': use the sha256sum (timestamp optimization enabled)
+  'sha256_strict': use the sha256sum, always check the content even if
+                   the timestamp did not change
   'timestamp': use the timestamp
 """
 }
@@ -482,6 +485,9 @@ class DoitCmdBase(Command):
                        "of available checkers.").format(
                            check_file_uptodate, self.bin_name)
                 raise InvalidCommand(msg)
+            if check_file_uptodate == 'sha256_strict':
+                # instantiate SHA256Checker with strict-content mode enabled
+                return (CHECKERS[check_file_uptodate], {'strict': True})
             return CHECKERS[check_file_uptodate]
         else:
             # user defined class

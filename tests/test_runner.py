@@ -7,7 +7,7 @@ import platform
 from unittest.mock import Mock, patch
 
 from doit.exceptions import BaseFail, InvalidTask
-from doit.dependency import DbmDB, Dependency
+from doit.dependency import DbmDB, JsonDB, Dependency, SHA256Checker
 from doit.reporter import ConsoleReporter
 from doit.task import Task, DelayedLoader
 from doit.control import TaskDispatcher, ExecNode
@@ -572,6 +572,78 @@ class TestRunnerRunTasks_Runner(RunnerRunTasksBase, DepManagerMixin,
         self.assertIn("Dependent file 'i_dont_exist' does not exist",
                        str(fail_log[2]))
         self.assertFalse(reporter.log)
+
+
+class TestRunnerSHA256Strict(DepfileNameMixin, unittest.TestCase):
+    """Runner integration tests with SHA256Checker on strict mode."""
+
+    def setUp(self):
+        super().setUp()
+        self.reporter = FakeReporter()
+        self.dep_manager = Dependency(
+            JsonDB, self.depfile_name,
+            checker_cls=(SHA256Checker, {'strict': True}))
+
+    def tearDown(self):
+        if not self.dep_manager._closed:
+            self.dep_manager.close()
+        super().tearDown()
+
+    def _write_dep(self, content):
+        dep_path = os.path.join(os.path.dirname(self.depfile_name),
+                                'strict-dep.txt')
+        with open(dep_path, 'w') as fd:
+            fd.write(content)
+        return dep_path
+
+    def test_failed_task_saves_no_state(self):
+        dep_path = self._write_dep('abc')
+        t1 = Task('t1', [_fail], [dep_path])
+        my_runner = runner.Runner(self.dep_manager, self.reporter)
+        my_runner.run_tasks(TaskDispatcher({'t1': t1}, [], ['t1']))
+        self.assertEqual(runner.FAILURE, my_runner.finish())
+        # failed task: no success evidence was saved
+        self.assertFalse(self.dep_manager._in('t1'))
+
+        # a second run executes the task again (nothing was saved)
+        t2 = Task('t1', [(ok,)], [dep_path])
+        reporter2 = FakeReporter()
+        my_runner2 = runner.Runner(self.dep_manager, reporter2)
+        my_runner2.run_tasks(TaskDispatcher({'t1': t2}, [], ['t1']))
+        self.assertEqual(runner.SUCCESS, my_runner2.finish())
+        self.assertEqual(('execute', t2), reporter2.log[1])
+        # after the success the state was saved
+        self.assertTrue(self.dep_manager._in('t1'))
+
+    def test_copy_preserving_mtime_detected(self):
+        dep_path = self._write_dep('abc')
+        t1 = Task('t1', [(ok,)], [dep_path])
+        my_runner = runner.Runner(self.dep_manager, self.reporter)
+        my_runner.run_tasks(TaskDispatcher({'t1': t1}, [], ['t1']))
+        self.assertEqual(runner.SUCCESS, my_runner.finish())
+
+        # second run: task is up-to-date
+        t2 = Task('t1', [(ok,)], [dep_path])
+        reporter2 = FakeReporter()
+        my_runner2 = runner.Runner(self.dep_manager, reporter2)
+        my_runner2.run_tasks(TaskDispatcher({'t1': t2}, [], ['t1']))
+        self.assertEqual(runner.SUCCESS, my_runner2.finish())
+        self.assertIn(('up-to-date', t2), reporter2.log)
+        self.assertNotIn(('execute', t2), reporter2.log)
+
+        # replace content with same-length data preserving the mtime
+        # (like a copy made with `cp -p`): strict mode must detect it
+        original_stat = os.stat(dep_path)
+        with open(dep_path, 'w') as fd:
+            fd.write('xyz')
+        os.utime(dep_path, (original_stat.st_atime, original_stat.st_mtime))
+
+        t3 = Task('t1', [(ok,)], [dep_path])
+        reporter3 = FakeReporter()
+        my_runner3 = runner.Runner(self.dep_manager, reporter3)
+        my_runner3.run_tasks(TaskDispatcher({'t1': t3}, [], ['t1']))
+        self.assertEqual(runner.SUCCESS, my_runner3.finish())
+        self.assertIn(('execute', t3), reporter3.log)
 
 
 class TestRunnerRunTasks_MThread(RunnerRunTasksBase, DepManagerMixin,

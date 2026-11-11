@@ -321,13 +321,33 @@ check_file_uptodate
 (see :ref:`file-dep`).  Use the option ``--check_file_uptodate`` to choose:
 
  * `md5`: use the md5sum.
+ * `sha256`: use the sha256sum, keeping the timestamp optimization.
+ * `sha256_strict`: use the sha256sum, always checking the file content.
  * `timestamp`: use the timestamp.
+
+The `sha256` and `md5` checkers save a state containing
+``(mtime, size, digest)`` and share the same optimization: if the `mtime`
+did not change the file is assumed unchanged and its content is not read.
+The `sha256_strict` checker always hashes the content, so it detects a
+change even when the `mtime` was preserved, e.g. when a file is replaced
+by a copy made with ``cp -p`` or ``rsync -t``. Repeated checks of the same
+file within one run share the computed digest, unless the file's
+``(mtime, size)`` changed.
 
 .. note::
 
    The `timestamp` checker considers a file is not up-to-date if there is
    **any** change in the the modified time (`mtime`), it does not matter if
    the new time is in the future or past of the original timestamp.
+
+.. note::
+
+   Switching the checker of a task (e.g. from `md5` to `sha256`) forces the
+   task to be executed once so its state is recomputed with the new checker.
+   States saved by the `md5` checker are never compared against sha256
+   digests; they are safely migrated on the next successful execution.
+   Switching back (e.g. `sha256` to `md5`) likewise re-runs the affected
+   tasks once. A failed task never updates the saved state.
 
 
 You can set this option from command line, but you probably want to set it for

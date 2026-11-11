@@ -6,7 +6,7 @@ from unittest.mock import patch
 from doit import version
 from doit.cmdparse import CmdParseError, CmdParse
 from doit.exceptions import InvalidCommand, InvalidDodoFile
-from doit.dependency import FileChangedChecker, JSONCodec
+from doit.dependency import FileChangedChecker, JSONCodec, SHA256Checker
 from doit.task import Task
 from doit.loader import task_params
 from doit.cmd_base import version_tuple, Command, DoitCmdBase
@@ -287,6 +287,24 @@ class TestDoitCmdBase(DepfileNameMixin, unittest.TestCase):
         params['dep_file'] = self.depfile_name
         mycmd.execute(params, args)
         self.assertIsInstance(mycmd.dep_manager.checker, MyChecker)
+
+    def testSHA256Checker(self):
+        mycmd = self.MyCmd(task_loader=ModuleTaskLoader({}))
+        params, args = CmdParse(mycmd.get_options()).parse([])
+        params['check_file_uptodate'] = 'sha256'
+        params['dep_file'] = self.depfile_name
+        mycmd.execute(params, args)
+        self.assertIsInstance(mycmd.dep_manager.checker, SHA256Checker)
+        self.assertFalse(mycmd.dep_manager.checker.strict)
+
+    def testSHA256StrictChecker(self):
+        mycmd = self.MyCmd(task_loader=ModuleTaskLoader({}))
+        params, args = CmdParse(mycmd.get_options()).parse([])
+        params['check_file_uptodate'] = 'sha256_strict'
+        params['dep_file'] = self.depfile_name
+        mycmd.execute(params, args)
+        self.assertIsInstance(mycmd.dep_manager.checker, SHA256Checker)
+        self.assertTrue(mycmd.dep_manager.checker.strict)
 
     def testCustomCodec(self):
         class MyCodec(JSONCodec):

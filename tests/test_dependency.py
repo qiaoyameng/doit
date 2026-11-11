@@ -10,10 +10,11 @@ from unittest.mock import patch
 import unittest
 
 from doit.task import Task
-from doit.dependency import get_md5, get_file_md5
-from doit.dependency import DbmDB, Dependency
+from doit.dependency import get_md5, get_file_md5, get_file_sha256
+from doit.dependency import DbmDB, JsonDB, SqliteDB, Dependency
 from doit.dependency import DatabaseException, UptodateCalculator
-from doit.dependency import FileChangedChecker, MD5Checker, TimestampChecker
+from doit.dependency import (
+    FileChangedChecker, MD5Checker, SHA256Checker, TimestampChecker)
 from doit.dependency import DependencyStatus
 from tests.support import get_abspath, backend_map, db_ext
 from tests.support import DependencyFileMixin
@@ -515,6 +516,144 @@ class TestTimestampChecker(DependencyFileMixin, unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# TestSHA256Checker
+# ---------------------------------------------------------------------------
+
+def rewrite_same_size(path, content):
+    """Replace file content with same-length data, keeping the mtime.
+
+    Simulates a copy that preserves timestamps (e.g. ``cp -p``), the
+    scenario where timestamp-based checks miss a content change.
+    """
+    original_stat = os.stat(path)
+    assert len(content) == original_stat.st_size
+    with open(path, "w") as fd:
+        fd.write(content)
+    os.utime(path, (original_stat.st_atime, original_stat.st_mtime))
+
+
+class TestSHA256Checker(DependencyFileMixin, unittest.TestCase):
+
+    def test_state_format(self):
+        checker = SHA256Checker()
+        state = checker.get_state(self.dependency1, None)
+        timestamp, size, digest = state
+        self.assertEqual(os.path.getmtime(self.dependency1), timestamp)
+        self.assertEqual(os.path.getsize(self.dependency1), size)
+        self.assertEqual(get_file_sha256(self.dependency1), digest)
+        self.assertEqual(64, len(digest))
+
+    def test_timestamp_optimization(self):
+        # non-strict mode: same timestamp means same file, content is
+        # not hashed (same behavior as MD5Checker)
+        checker = SHA256Checker()
+        state = checker.get_state(self.dependency1, None)
+        state2 = (state[0], state[1] + 1, '')
+        file_stat = os.stat(self.dependency1)
+        self.assertFalse(checker.check_modified(self.dependency1, file_stat, state2))
+
+    def test_size(self):
+        checker = SHA256Checker()
+        state = checker.get_state(self.dependency1, None)
+        state2 = (state[0] + 1, state[1] + 1, state[2])
+        file_stat = os.stat(self.dependency1)
+        # if size changed for sure modified (sha256 is not checked)
+        self.assertTrue(checker.check_modified(self.dependency1, file_stat, state2))
+
+    def test_sha256(self):
+        checker = SHA256Checker()
+        state = checker.get_state(self.dependency1, None)
+        file_stat = os.stat(self.dependency1)
+        # same size and sha256
+        state2 = (state[0] + 1, state[1], state[2])
+        self.assertFalse(checker.check_modified(self.dependency1, file_stat, state2))
+        # same size, different sha256
+        state3 = (state[0] + 1, state[1], 'not me')
+        self.assertTrue(checker.check_modified(self.dependency1, file_stat, state3))
+
+    def test_same_timestamp_different_content(self):
+        # strict mode detects content change even if mtime is preserved
+        checker = SHA256Checker(strict=True)
+        state = checker.get_state(self.dependency1, None)
+        size = os.path.getsize(self.dependency1)
+        rewrite_same_size(self.dependency1, 'X' * size)
+        file_stat = os.stat(self.dependency1)
+        self.assertTrue(checker.check_modified(self.dependency1, file_stat, state))
+        # non-strict mode trusts the timestamp and misses the change
+        fast_checker = SHA256Checker()
+        self.assertFalse(
+            fast_checker.check_modified(self.dependency1, file_stat, state))
+
+    def test_strict_unmodified_file(self):
+        # strict mode still considers an untouched file as not modified
+        checker = SHA256Checker(strict=True)
+        state = checker.get_state(self.dependency1, None)
+        file_stat = os.stat(self.dependency1)
+        self.assertFalse(checker.check_modified(self.dependency1, file_stat, state))
+
+    def test_legacy_md5_state(self):
+        # states saved by MD5Checker (32-chars digest) are never trusted:
+        # always considered modified so the state is safely re-computed
+        # and migrated to sha256 on the next successful save
+        md5_checker = MD5Checker()
+        legacy_state = md5_checker.get_state(self.dependency1, None)
+        self.assertEqual(32, len(legacy_state[2]))
+        checker = SHA256Checker()
+        file_stat = os.stat(self.dependency1)
+        # even with unchanged content and timestamp: needs re-computation
+        self.assertTrue(
+            checker.check_modified(self.dependency1, file_stat, legacy_state))
+        # also on strict mode
+        strict_checker = SHA256Checker(strict=True)
+        self.assertTrue(
+            strict_checker.check_modified(
+                self.dependency1, file_stat, legacy_state))
+
+    def test_get_state_skip_unchanged_timestamp(self):
+        # get_state returns None if the saved timestamp is unchanged
+        # (optimization, only on non-strict mode)
+        checker = SHA256Checker()
+        state = checker.get_state(self.dependency1, None)
+        self.assertIsNone(checker.get_state(self.dependency1, state))
+        # strict mode always computes a fresh state
+        strict_checker = SHA256Checker(strict=True)
+        self.assertIsNotNone(strict_checker.get_state(self.dependency1, state))
+
+    def test_digest_cache(self):
+        # repeated checks of the same file within a run share the digest
+        state = SHA256Checker().get_state(self.dependency1, None)
+        # force the hash path by using a different saved timestamp
+        state = (state[0] + 1, state[1], state[2])
+        checker = SHA256Checker()
+        file_stat = os.stat(self.dependency1)
+        with patch('doit.dependency.get_file_sha256',
+                   wraps=get_file_sha256) as mock_sha:
+            checker.check_modified(self.dependency1, file_stat, state)
+            checker.check_modified(self.dependency1, file_stat, state)
+        self.assertEqual(1, mock_sha.call_count)
+        # but a modified file is never checked against a stale digest:
+        # a normal modification updates the mtime, invalidating the cache
+        size = os.path.getsize(self.dependency1)
+        with open(self.dependency1, "w") as fd:
+            fd.write('Z' * size)
+        os.utime(self.dependency1, (file_stat.st_atime, file_stat.st_mtime + 2))
+        file_stat = os.stat(self.dependency1)
+        self.assertTrue(checker.check_modified(self.dependency1, file_stat, state))
+
+    def test_strict_no_digest_cache(self):
+        # strict mode never re-uses a cached digest: the content is read
+        # from disk on every check
+        checker = SHA256Checker(strict=True)
+        state = checker.get_state(self.dependency1, None)
+        file_stat = os.stat(self.dependency1)
+        with patch('doit.dependency.get_file_sha256',
+                   wraps=get_file_sha256) as mock_sha:
+            checker.check_modified(self.dependency1, file_stat, state)
+            checker.check_modified(self.dependency1, file_stat, state)
+        self.assertEqual(2, mock_sha.call_count)
+
+
+# ---------------------------------------------------------------------------
 # TestDependencyStatus
 # ---------------------------------------------------------------------------
 
@@ -912,3 +1051,155 @@ class TestGetStatusDbmNdbm(DependencyTestBase, _GetStatusTests, unittest.TestCas
 
 class TestGetStatusDbmDumb(DependencyTestBase, _GetStatusTests, unittest.TestCase):
     backend_name = 'dbm.dumb'
+
+
+# ---------------------------------------------------------------------------
+# SHA256Checker integration tests (per backend)
+# ---------------------------------------------------------------------------
+
+class _SHA256DepTests:
+    """Integration tests for SHA256Checker against real DB backends.
+
+    Uses small files with equal length, same mtime but different content,
+    reproducing the "copy preserving mtime" scenario without touching
+    file timestamps to work around the check.
+    """
+    backend_cls = None
+
+    def _reopen(self, checker_cls=MD5Checker, checker_kwargs=None):
+        """close current dep_manager and re-open the same DB file"""
+        if not self.dep_manager._closed:
+            self.dep_manager.close()
+        cls = checker_cls
+        if checker_kwargs is not None:
+            cls = (checker_cls, checker_kwargs)
+        self.dep_manager = Dependency(
+            self.backend_cls, self.dep_manager.name, checker_cls=cls)
+        return self.dep_manager
+
+    def _write_small_file(self, content):
+        path = os.path.join(self._dep_tmpdir, 'small-dep.txt')
+        with open(path, 'w') as fd:
+            fd.write(content)
+        return path
+
+    def test_copy_preserving_mtime(self):
+        # small file, same length, same mtime, different content
+        dep_path = self._write_small_file('abc')
+        t1 = Task('t1', None, [dep_path])
+        dep = self._reopen(SHA256Checker, {'strict': True})
+        self.assertEqual('run', dep.get_status(t1, {}).status)
+        dep.save_success(t1)
+        self.assertEqual('up-to-date', dep.get_status(t1, {}).status)
+
+        # replace content with same-length data, preserving the mtime
+        # (like `cp -p` of a modified copy over the original file)
+        rewrite_same_size(dep_path, 'xyz')
+
+        # strict mode re-checks the content and detects the change
+        self.assertEqual('run', dep.get_status(t1, {}).status)
+        self.assertEqual([dep_path], t1.dep_changed)
+
+        # non-strict mode keeps the timestamp optimization and would
+        # miss this change (documented behavior)
+        dep_fast = self._reopen(SHA256Checker)
+        self.assertEqual('up-to-date', dep_fast.get_status(t1, {}).status)
+
+    def test_migrate_from_md5(self):
+        # save state with the old MD5Checker
+        dep_path = self._write_small_file('abc')
+        t1 = Task('t1', None, [dep_path])
+        self.dep_manager.save_success(t1)
+        old_state = self.dep_manager._get('t1', dep_path)
+        self.assertEqual(32, len(old_state[2]))  # md5 hexdigest
+
+        # re-open old DB with sha256 checker: task must run once to
+        # migrate the state (legacy md5 state is never trusted)
+        dep = self._reopen(SHA256Checker)
+        self.assertEqual('run', dep.get_status(t1, {}).status)
+        self.assertEqual([dep_path], t1.dep_changed)
+
+        # after a successful run the state is migrated to sha256
+        dep.save_success(t1)
+        new_state = dep._get('t1', dep_path)
+        self.assertEqual(64, len(new_state[2]))  # sha256 hexdigest
+        self.assertEqual('SHA256Checker', dep._get('t1', 'checker:'))
+
+        # and now the task is up-to-date again
+        self.assertEqual('up-to-date', dep.get_status(t1, {}).status)
+
+        # strict mode also migrates old md5 states
+        dep_strict = self._reopen(SHA256Checker, {'strict': True})
+        self.assertEqual('up-to-date', dep_strict.get_status(t1, {}).status)
+
+    def test_switch_back_to_md5(self):
+        # save state with sha256 checker
+        dep_path = self._write_small_file('abc')
+        t1 = Task('t1', None, [dep_path])
+        dep = self._reopen(SHA256Checker)
+        dep.save_success(t1)
+        self.assertEqual('up-to-date', dep.get_status(t1, {}).status)
+
+        # switching back to md5 forces a re-run (checker changed)
+        dep_md5 = self._reopen(MD5Checker)
+        self.assertEqual('run', dep_md5.get_status(t1, {}).status)
+        dep_md5.save_success(t1)
+        self.assertEqual('up-to-date', dep_md5.get_status(t1, {}).status)
+        self.assertEqual('MD5Checker', dep_md5._get('t1', 'checker:'))
+
+    def test_failed_task_saves_no_state(self):
+        # new success evidence is only saved after the task actually
+        # succeeds (save_success is not called for failed tasks)
+        dep_path = self._write_small_file('abc')
+        t1 = Task('t1', None, [dep_path])
+        dep = self._reopen(SHA256Checker, {'strict': True})
+        self.assertEqual('run', dep.get_status(t1, {}).status)
+        # task fails: no save_success call, no state was persisted
+        self.assertIsNone(dep._get('t1', dep_path))
+        self.assertIsNone(dep._get('t1', 'checker:'))
+        # next run still considers the task out-of-date
+        self.assertEqual('run', dep.get_status(t1, {}).status)
+        # after a real success the evidence is saved
+        dep.save_success(t1)
+        self.assertEqual('up-to-date', dep.get_status(t1, {}).status)
+
+    def test_digest_shared_between_tasks(self):
+        # two tasks depending on the same file share the digest computed
+        # within the same run (non-strict mode keeps the optimization)
+        dep_path = self._write_small_file('abc')
+        t1 = Task('t1', None, [dep_path])
+        t2 = Task('t2', None, [dep_path])
+        dep = self._reopen(SHA256Checker)
+        dep.save_success(t1)
+        dep.save_success(t2)
+        # force hashing by bumping the saved timestamp, then re-open so
+        # the checker starts with an empty digest cache
+        for task in (t1, t2):
+            state = dep._get(task.name, dep_path)
+            dep._set(task.name, dep_path, (state[0] + 1, state[1], state[2]))
+        dep = self._reopen(SHA256Checker)
+        with patch('doit.dependency.get_file_sha256',
+                   wraps=get_file_sha256) as mock_sha:
+            self.assertEqual('up-to-date', dep.get_status(t1, {}).status)
+            self.assertEqual('up-to-date', dep.get_status(t2, {}).status)
+        self.assertEqual(1, mock_sha.call_count)
+
+        # strict mode never trusts a cached digest: a later change must
+        # always be re-read from disk even with a preserved mtime
+        dep_strict = self._reopen(SHA256Checker, {'strict': True})
+        with patch('doit.dependency.get_file_sha256',
+                   wraps=get_file_sha256) as mock_sha_strict:
+            dep_strict.get_status(t1, {})
+            rewrite_same_size(dep_path, 'xyz')
+            dep_strict.get_status(t2, {})
+        self.assertEqual(2, mock_sha_strict.call_count)
+
+
+class TestSHA256DepJson(DependencyTestBase, _SHA256DepTests, unittest.TestCase):
+    backend_name = 'json'
+    backend_cls = JsonDB
+
+
+class TestSHA256DepSqlite(DependencyTestBase, _SHA256DepTests, unittest.TestCase):
+    backend_name = 'sqlite3'
+    backend_cls = SqliteDB

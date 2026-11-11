@@ -295,3 +295,84 @@ class TestPythonInteractiveAction(unittest.TestCase):
         got = my_action.execute()
         self.assertIsNone(got)
         self.assertEqual(my_action.result, 'hello')
+
+
+class TestEnvChanged(unittest.TestCase):
+    def test_no_env_declaration_is_ignored(self):
+        uptodate = tools.env_changed()
+        t1 = task.Task("TaskX", None, uptodate=[uptodate])
+        # None means the check has no effect (old behavior preserved)
+        self.assertIsNone(uptodate(t1, t1.values))
+
+    def test_unchanged(self):
+        ua = tools.env_changed()
+        ub = tools.env_changed()
+        t1 = task.Task("TaskX", None, env={'TZ': 'UTC'}, uptodate=[ua])
+        t2 = task.Task("TaskY", None, env={'TZ': 'CET'}, uptodate=[ub])
+        self.assertFalse(ua(t1, t1.values))
+        self.assertFalse(ub(t2, t2.values))
+        t1.save_extra_values()
+        t2.save_extra_values()
+        self.assertTrue(ua(t1, t1.values))
+        self.assertTrue(ub(t2, t2.values))
+
+    def test_changed_value(self):
+        uptodate = tools.env_changed()
+        t1 = task.Task("TaskX", None, env={'TZ': 'UTC'}, uptodate=[uptodate])
+        self.assertFalse(uptodate(t1, t1.values))
+        t1.save_extra_values()
+        self.assertTrue(uptodate(t1, t1.values))
+        # same variable, different value -> not up-to-date
+        t2 = task.Task("TaskX", None, env={'TZ': 'CET'}, uptodate=[uptodate])
+        self.assertFalse(uptodate(t2, t1.values))
+
+    def test_selected_names(self):
+        uptodate = tools.env_changed(['TZ'])
+        t1 = task.Task("TaskX", None,
+                       env={'TZ': 'UTC', 'LC_ALL': 'C'},
+                       uptodate=[uptodate])
+        self.assertFalse(uptodate(t1, t1.values))
+        t1.save_extra_values()
+        self.assertTrue(uptodate(t1, t1.values))
+        # change on a non-selected variable does not affect the check
+        t2 = task.Task("TaskX", None,
+                       env={'TZ': 'UTC', 'LC_ALL': 'en_US.UTF-8'},
+                       uptodate=[uptodate])
+        self.assertTrue(uptodate(t2, t1.values))
+        # change on the selected variable does
+        t3 = task.Task("TaskX", None,
+                       env={'TZ': 'CET', 'LC_ALL': 'C'},
+                       uptodate=[uptodate])
+        self.assertFalse(uptodate(t3, t1.values))
+
+    def test_sensitive_value_not_saved(self):
+        from doit.task_env import SensitiveValue
+        uptodate = tools.env_changed()
+        t1 = task.Task("TaskX", None,
+                       env={'TOKEN': SensitiveValue('plain-secret')},
+                       uptodate=[uptodate])
+        self.assertFalse(uptodate(t1, t1.values))
+        t1.save_extra_values()
+        saved = t1.values['_env_changed']
+        # only the field name and an irreversible fingerprint are saved
+        self.assertEqual(['TOKEN'], list(saved))
+        self.assertNotIn('plain-secret', json.dumps(saved))
+        self.assertEqual(64, len(saved['TOKEN']))
+        self.assertTrue(uptodate(t1, t1.values))
+
+    def test_saved_is_names_and_fingerprints(self):
+        uptodate = tools.env_changed()
+        t1 = task.Task("TaskX", None,
+                       env={'TZ': 'UTC', 'OLD': None},
+                       uptodate=[uptodate])
+        self.assertFalse(uptodate(t1, t1.values))
+        t1.save_extra_values()
+        saved = t1.values['_env_changed']
+        self.assertEqual({'OLD': None, 'TZ': saved['TZ']}, saved)
+        self.assertEqual(64, len(saved['TZ']))
+        self.assertNotIn('UTC', json.dumps(saved))
+
+    def test_repr(self):
+        self.assertEqual("env_changed()", repr(tools.env_changed()))
+        self.assertEqual("env_changed(('TZ',))",
+                         repr(tools.env_changed(['TZ'])))

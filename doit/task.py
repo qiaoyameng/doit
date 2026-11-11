@@ -12,6 +12,7 @@ from .cmdparse import CmdOption, TaskParse
 from .exceptions import BaseFail, InvalidTask
 from .action import create_action, PythonAction
 from .dependency import UptodateCalculator
+from .task_env import TaskEnvSpec
 
 
 def first_line(doc):
@@ -132,6 +133,9 @@ class Task:
     @ivar getargs: (dict) values from other tasks
     @ivar doc: (string) task documentation
     @ivar meta: (dict) extra info from user/plugin not directly used by doit
+    @ivar env_spec: (TaskEnvSpec) per-task environment declaration
+    @ivar env_snapshot: (EnvSnapshot) fixed environment for the current run,
+                        created once when the task starts executing
 
     @ivar options: (dict) calculated params values (from getargs and taskopt)
     @ivar taskopt: (cmdparse.CmdParse)
@@ -161,6 +165,7 @@ class Task:
                   'pos_arg': (string_types, (None,)),
                   'verbosity': ((), (None, 0, 1, 2,)),
                   'io': ((dict,), (None,)),
+                  'env': ((dict,), (None,)),
                   'getargs': ((dict,), ()),
                   'title': ((Callable,), (None,)),
                   'watch': ((list, tuple), ()),
@@ -174,7 +179,7 @@ class Task:
                  subtask_of=None, has_subtask=False,
                  doc=None, params=(), pos_arg=None,
                  verbosity=None, io=None, title=None, getargs=None,
-                 watch=(), meta=None, loader=None):
+                 watch=(), meta=None, loader=None, env=None):
         """sanity checks and initialization
 
         @param params: (list of dict for parameters) see cmdparse.CmdOption
@@ -197,6 +202,7 @@ class Task:
         self.check_attr(name, 'verbosity', verbosity, self.valid_attr['verbosity'])
         self.check_attr(name, 'io', io, self.valid_attr['io'])
         self.check_attr(name, 'getargs', getargs, self.valid_attr['getargs'])
+        self.check_attr(name, 'env', env, self.valid_attr['env'])
         self.check_attr(name, 'title', title, self.valid_attr['title'])
         self.check_attr(name, 'watch', watch, self.valid_attr['watch'])
         self.check_attr(name, 'meta', meta, self.valid_attr['meta'])
@@ -214,6 +220,10 @@ class Task:
 
         # actions
         self.io = IOConfig(io or {})
+        # per-task environment declaration, validated eagerly
+        self.env_spec = TaskEnvSpec(env or {}, name) if env else None
+        # fixed snapshot created once when the task starts executing
+        self.env_snapshot = None
         self._action_instances = None
         if actions is None:
             self._actions = []

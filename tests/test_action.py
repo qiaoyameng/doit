@@ -17,7 +17,7 @@ from unittest.mock import Mock
 
 from doit import action
 from doit.task import Task
-from doit.exceptions import TaskError, TaskFailed
+from doit.exceptions import TaskError, TaskFailed, InvalidTask
 
 
 # path to test folder (the original tests/ dir where sample_process.py lives)
@@ -1010,3 +1010,127 @@ class TestCreateAction(unittest.TestCase):
             action.create_action(True, self.mytask, 'clean')
         self.assertIn(expected, str(cm.exception))
 
+
+
+############# per-task env
+class TestCmdActionEnv(unittest.TestCase):
+    def setUp(self):
+        self.command = ('%s -c "import os,sys; '
+                        'sys.stdout.write(os.environ.get(\'DOIT_ENV_X\', \'\'))"'
+                        % executable)
+
+    def _action(self, env, cmd_action=None):
+        cmd_action = cmd_action or self.command
+        task = Task('tenv', [cmd_action], env=env)
+        task.env_snapshot = task.env_spec.resolve({})
+        task.init_options()
+        return task.actions[0]
+
+    def test_task_env_applied_to_subprocess(self):
+        my_action = self._action({'DOIT_ENV_X': 'tz-utc'})
+        self.assertIsNone(my_action.execute())
+        self.assertEqual('tz-utc', my_action.out)
+
+    def test_explicit_env_pkwarg_wins(self):
+        task = Task('tenv',
+                    [action.CmdAction(self.command,
+                                      env={'DOIT_ENV_X': 'from-pkwarg'})],
+                    env={'DOIT_ENV_X': 'from-task'})
+        task.env_snapshot = task.env_spec.resolve({})
+        task.init_options()
+        my_action = task.actions[0]
+        self.assertIsNone(my_action.execute())
+        self.assertEqual('from-pkwarg', my_action.out)
+
+    def test_deleted_variable_not_in_subprocess(self):
+        command = ('%s -c "import os,sys; '
+                   'sys.stdout.write(os.environ.get(\'DOIT_ENV_DEL\', \'gone\'))"'
+                   % executable)
+        my_action = self._action({'DOIT_ENV_DEL': None}, cmd_action=command)
+        self.assertIsNone(my_action.execute())
+        self.assertEqual('gone', my_action.out)
+
+
+def _read_env_var(name):
+    import os
+    return os.environ.get(name)
+
+
+def _mutate_own_env(name):
+    import os
+    os.environ[name] = 'hacked-inside-action'
+
+
+class TestPythonActionEnv(unittest.TestCase):
+    def test_env_applied_and_restored(self):
+        my_task = Task('pyenv', [(_read_env_var, ['DOIT_PY_ENV'])],
+                       env={'DOIT_PY_ENV': 'set-by-task'})
+        action_obj = my_task.actions[0]
+        my_task.env_snapshot = my_task.env_spec.resolve({})
+        my_task.init_options()
+        before = os.environ.copy()
+        result = action_obj.execute()
+        self.assertIsNone(result)
+        self.assertEqual('set-by-task', action_obj.result)
+        # parent process environment is unchanged after execution
+        self.assertEqual(before, os.environ)
+        self.assertNotIn('DOIT_PY_ENV', os.environ)
+
+    def test_deleted_variable_removed_and_restored(self):
+        os.environ['DOIT_PY_DEL'] = 'present'
+        self.addCleanup(os.environ.pop, 'DOIT_PY_DEL', None)
+        my_task = Task('pyenv', [(_read_env_var, ['DOIT_PY_DEL'])],
+                       env={'DOIT_PY_DEL': None})
+        action_obj = my_task.actions[0]
+        my_task.env_snapshot = my_task.env_spec.resolve(os.environ)
+        my_task.init_options()
+        result = action_obj.execute()
+        self.assertIsNone(result)
+        self.assertIsNone(action_obj.result)
+        self.assertEqual('present', os.environ['DOIT_PY_DEL'])
+
+    def test_action_mutating_environ_does_not_leak(self):
+        my_task = Task('pyenv', [(_mutate_own_env, ['DOIT_PY_MUT'])],
+                       env={'DOIT_PY_MUT': 'initial'})
+        action_obj = my_task.actions[0]
+        my_task.env_snapshot = my_task.env_spec.resolve({})
+        my_task.init_options()
+        before = os.environ.copy()
+        self.assertIsNone(action_obj.execute())
+        self.assertEqual(before, os.environ)
+        self.assertNotIn('DOIT_PY_MUT', os.environ)
+
+    def test_refused_when_not_process_safe(self):
+        my_task = Task('pyenv', [_read_env_var], env={'TZ': 'UTC'})
+        action_obj = my_task.actions[0]
+        my_task.env_snapshot = my_task.env_spec.resolve({})
+        action_obj.in_process_env_safe = False
+        result = action_obj.execute()
+        self.assertIsInstance(result, TaskError)
+        self.assertIn('cannot be provided', str(result))
+
+    def test_no_snapshot_keeps_old_behavior(self):
+        # without a task env declaration nothing is swapped
+        my_task = Task('pyenv', [(_read_env_var, ['PATH'])])
+        action_obj = my_task.actions[0]
+        action_obj.in_process_env_safe = False
+        my_task.init_options()
+        result = action_obj.execute()
+        self.assertIsNone(result)
+        self.assertEqual(os.environ['PATH'], action_obj.result)
+
+
+class TestTaskEnvAttribute(unittest.TestCase):
+    def test_no_env_keeps_none(self):
+        task = Task('plain', [])
+        self.assertIsNone(task.env_spec)
+        self.assertIsNone(task.env_snapshot)
+
+    def test_invalid_env_raises(self):
+        self.assertRaises(InvalidTask, Task, 'bad', [], env={'TZ': 123})
+
+    def test_sensitive_value_repr_not_logged(self):
+        from doit.task_env import SensitiveValue
+        task = Task('secret', [], env={'TOKEN': SensitiveValue('top-secret')})
+        self.assertNotIn('top-secret', repr(task.env_spec))
+        self.assertNotIn('top-secret', str(task.env_spec.overrides['TOKEN']))

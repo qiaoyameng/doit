@@ -705,3 +705,34 @@ class TestResultDep(DepManagerMixin, unittest.TestCase):
                          self.dep_manager.get_status(
                              tasks['t1'], tasks).status)
 
+
+
+class TestTaskEnvAttribute(unittest.TestCase):
+    def test_no_env_keeps_old_behavior(self):
+        t = task.Task('plain', ['cmd'])
+        self.assertIsNone(t.env_spec)
+        self.assertIsNone(t.env_snapshot)
+
+    def test_env_spec_parsed(self):
+        t = task.Task('with_env', ['cmd'],
+                      env={'TZ': 'UTC', 'OLD': None})
+        self.assertEqual({'TZ': 'UTC'}, t.env_spec.overrides)
+        self.assertEqual({'OLD'}, t.env_spec.deletions)
+        self.assertIsNone(t.env_snapshot)
+
+    def test_invalid_env(self):
+        self.assertRaises(task.InvalidTask, task.Task,
+                          'bad', ['cmd'], env={'TZ': 5})
+
+    def test_env_picklable(self):
+        import pickle
+        t = task.Task('pickle_env', ['cmd'], env={'TZ': 'UTC'})
+        t.env_snapshot = t.env_spec.resolve({})
+        restored = pickle.loads(pickle.dumps(t))
+        self.assertEqual(restored.env_snapshot.environ,
+                         t.env_snapshot.environ)
+
+    def test_dict_to_task_accepts_env(self):
+        t = task.dict_to_task({'name': 'from_dict', 'actions': ['cmd'],
+                               'env': {'TZ': 'UTC'}})
+        self.assertEqual({'TZ': 'UTC'}, t.env_spec.overrides)

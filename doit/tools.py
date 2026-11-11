@@ -11,6 +11,7 @@ import subprocess
 from . import exceptions
 from .action import CmdAction, PythonAction
 from .task import result_dep  # imported for backward compatibility
+from .task_env import env_unsafe_error
 result_dep  # pyflakes
 
 
@@ -81,6 +82,54 @@ class config_changed:
 
     def __repr__(self):
         return "config_changed(%r)" % self.config
+
+
+
+# uptodate
+class env_changed:
+    """check if the task's declared environment changed since last run.
+
+    Used together with the task ``env`` attribute.  Only an irreversible
+    digest is saved in the dependency DB, so sensitive values are never
+    persisted in plain text.
+
+    :param names: (sequence of str) restrict the check to these variables.
+                  If not given all variables from the task ``env``
+                  declaration participate.  Variables not declared by the
+                  task are ignored.
+    """
+    def __init__(self, names=None):
+        self.names = tuple(names) if names else None
+        self.env_digest = None
+
+    def _calc_digest(self, task):
+        spec = task.env_spec
+        if spec is None:
+            # no env declaration: this check has no effect
+            return None
+        # dict of {field-name: irreversible fingerprint} (None if deleted).
+        # only names and digests are saved, never plain text values.
+        return spec.variable_fingerprints(self.names)
+
+    def configure_task(self, task):
+        task.value_savers.append(
+            lambda: {'_env_changed': self.env_digest})
+
+    def __call__(self, task, values):
+        """return True if selected env variables are UNCHANGED"""
+        self.env_digest = self._calc_digest(task)
+        if self.env_digest is None:
+            # nothing to check (task has no env declaration)
+            return None
+        last_success = values.get('_env_changed')
+        if last_success is None:
+            return False
+        return last_success == self.env_digest
+
+    def __repr__(self):
+        if self.names is None:
+            return "env_changed()"
+        return "env_changed(%r)" % (self.names,)
 
 
 
@@ -184,8 +233,10 @@ class LongRunning(CmdAction):
     """
     def execute(self, out=None, err=None):
         action = self.expand_action()
+        env, subprocess_pkwargs = self._build_env()
         process = subprocess.Popen(
-            action, shell=self.shell, stdout=out, stderr=err, **self.pkwargs)
+            action, shell=self.shell, stdout=out, stderr=err, env=env,
+            **subprocess_pkwargs)
         try:
             process.wait()
         except KeyboardInterrupt:
@@ -203,8 +254,10 @@ class Interactive(CmdAction):
     """
     def execute(self, out=None, err=None):
         action = self.expand_action()
+        env, subprocess_pkwargs = self._build_env()
         process = subprocess.Popen(
-            action, shell=self.shell, stdout=out, stderr=err, **self.pkwargs)
+            action, shell=self.shell, stdout=out, stderr=err, env=env,
+            **subprocess_pkwargs)
         process.wait()
         if process.returncode != 0:
             return exceptions.TaskFailed(
@@ -221,11 +274,16 @@ class PythonInteractiveAction(PythonAction):
        * it is successful unless a exception is raised
     """
     def execute(self, out=None, err=None):
+        # refuse if the declared env can not be provided safely
+        task_snapshot = getattr(self.task, 'env_snapshot', None)
+        if task_snapshot is not None and not self.in_process_env_safe:
+            return env_unsafe_error(self.task.name, self.py_callable)
         kwargs = self._prepare_kwargs()
-        try:
-            returned_value = self.py_callable(*self.args, **kwargs)
-        except Exception as exception:
-            return exceptions.TaskError("PythonAction Error", exception)
+        with self._env_context():
+            try:
+                returned_value = self.py_callable(*self.args, **kwargs)
+            except Exception as exception:
+                return exceptions.TaskError("PythonAction Error", exception)
         if isinstance(returned_value, str):
             self.result = returned_value
         elif isinstance(returned_value, dict):

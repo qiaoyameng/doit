@@ -652,6 +652,43 @@ This could be used by custom commands or plugins.
 .. literalinclude:: samples/metadata.py
 
 
+.. _task-env:
+
+env
+---
+
+The ``env`` attribute declares environment variables for the task's actions.
+It is a dict where each value can be:
+
+* a ``str``: override (or add) a variable,
+* ``None``: explicitly remove an inherited variable,
+* ``SensitiveValue``: like a ``str`` but kept out of logs and the dependency
+  DB (only the variable name and an irreversible SHA-256 fingerprint are
+  saved).
+
+Variables that are not mentioned are inherited from the parent process.
+This lets two parallel tasks use different timezones/locales without
+modifying ``os.environ`` of other tasks.
+
+.. literalinclude:: samples/task_env.py
+
+The declaration is resolved into a fixed snapshot when the task starts
+executing; every action of that run uses the same snapshot even if the
+parent environment changes meanwhile.
+
+``CmdAction`` spawns a new process, so it always receives the declared
+environment safely. ``PythonAction`` executes the callable in the running
+process and can only provide the declared environment by temporarily
+swapping ``os.environ``. This is done for the serial runner and for the
+multiprocessing runner (``-n``), where no other task can run concurrently in
+the same process. The threaded runner (``--parallel-type thread``) refuses
+such python-actions instead of silently polluting sibling tasks: use an
+isolated process or a ``CmdAction`` in that mode.
+
+To make a task re-execute when its declared environment changes, use
+:ref:`env_changed <env_changed>` in the ``uptodate`` list.
+
+
 pathlib
 --------
 

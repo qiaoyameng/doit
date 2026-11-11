@@ -1,6 +1,6 @@
 .. meta::
    :description: Customize the up-to-date check for incremental task execution
-   :keywords: python, doit, documentation, guide, incremental-build, result-dependency, run_one, config_changed, timeout
+   :keywords: python, doit, documentation, guide, incremental-build, result-dependency, run_one, config_changed, timeout, env_changed
 
 .. title:: Customize the up-to-date check for incremental execution
 
@@ -106,6 +106,27 @@ If converting the values of the dict requires a special encoder this can be
 passed with the argument ``encoder=...``. This will be passed on to `json.dumps()`.
 
 .. literalinclude:: samples/config_params.py
+
+
+.. _env_changed:
+
+env_changed()
+-------------
+
+``env_changed`` is used together with the task :ref:`env <task-env>`
+attribute to make a task re-execute when its declared environment changes.
+
+By default every variable of the task ``env`` declaration participates in
+the check. Pass a sequence of names to restrict the check to selected
+variables; changes of any other declared variable then leave the task
+up-to-date.
+
+Only an irreversible digest (SHA-256) of the values is saved in the
+dependency DB. Sensitive values (``SensitiveValue``) are never persisted or
+logged in plain text. A task without an ``env`` declaration is not affected
+by this check.
+
+.. literalinclude:: samples/env_changed.py
 
 
 .. _check_timestamp_unchanged:

@@ -951,3 +951,159 @@ class TestMThreadRunner_available(unittest.TestCase):
     def test_MThreadRunner_available(self):
         self.assertTrue(runner.MThreadRunner.available())
 
+
+
+# ---------------------------------------------------------------------------
+# per-task env: parallel isolation, thread refusal and env_changed reruns
+# ---------------------------------------------------------------------------
+
+# module-level (picklable) helpers for env runner tests
+def _assert_env_utc():
+    # succeeds only if this process sees its own declared environment
+    return (os.environ.get('TZ') == 'UTC'
+            and os.environ.get('LC_ALL') == 'C'
+            and 'DOIT_ENV_MARKER_B' not in os.environ
+            and os.environ.get('DOIT_ENV_MARKER_A') == 'a')
+
+
+def _assert_env_ny():
+    return (os.environ.get('TZ') == 'America/New_York'
+            and os.environ.get('LC_ALL') == 'en_US.UTF-8'
+            and 'DOIT_ENV_MARKER_A' not in os.environ
+            and os.environ.get('DOIT_ENV_MARKER_B') == 'b')
+
+
+def _count_a():
+    EnvRunnerCounters.task_a += 1
+
+
+def _count_b():
+    EnvRunnerCounters.task_b += 1
+
+
+CMD_PRINT_ENV = [
+    sys.executable, '-c',
+    "import json,os\n"
+    "print('ENVJSON ' + json.dumps({"
+    "'TZ': os.environ.get('TZ'),"
+    "'LC_ALL': os.environ.get('LC_ALL'),"
+    "'MARKER_A': 'DOIT_ENV_MARKER_A' in os.environ,"
+    "'MARKER_B': 'DOIT_ENV_MARKER_B' in os.environ}))",
+]
+
+
+class EnvRunnerCounters:
+    task_a = 0
+    task_b = 0
+
+
+class TestRunnerEnvParallel(DepManagerMixin, unittest.TestCase):
+    """two parallel tasks must see different envs, parent process unchanged"""
+
+    def setUp(self):
+        super().setUp()
+        self.reporter = FakeReporter()
+
+    def tearDown(self):
+        for name in ('DOIT_ENV_MARKER_A', 'DOIT_ENV_MARKER_B',
+                     'TZ', 'LC_ALL'):
+            os.environ.pop(name, None)
+        super().tearDown()
+
+    def _run(self, runner_class, tasks, num_process=2):
+        my_runner = runner_class(self.dep_manager, self.reporter,
+                                 num_process=num_process)
+        dispatcher = TaskDispatcher(
+            {task.name: task for task in tasks}, [],
+            [task.name for task in tasks])
+        my_runner.run_tasks(dispatcher)
+        return my_runner.finish()
+
+    @unittest.skipIf(not runner.MRunner.available(),
+                     'MRunner not available')
+    def test_python_actions_processes_isolated_and_restored(self):
+        before = os.environ.copy()
+        task_a = Task('env_a', [_assert_env_utc],
+                      env={'TZ': 'UTC', 'LC_ALL': 'C',
+                           'DOIT_ENV_MARKER_A': 'a'})
+        task_b = Task('env_b', [_assert_env_ny],
+                      env={'TZ': 'America/New_York',
+                           'LC_ALL': 'en_US.UTF-8',
+                           'DOIT_ENV_MARKER_B': 'b'})
+        # each action asserts its own snapshot inside its own process
+        self.assertEqual(runner.SUCCESS,
+                         self._run(runner.MRunner, [task_a, task_b]))
+        self.assertEqual(before, os.environ)
+
+    def test_python_actions_threads_refused_when_unsafe(self):
+        # the thread runner must refuse python-actions declaring env rather
+        # than mutating the shared process environment
+        from doit.action import PythonAction
+        task = Task('env_refused', [_assert_env_utc],
+                    env={'TZ': 'UTC'})
+        result = self._run(runner.MThreadRunner, [task])
+        self.assertEqual(runner.ERROR, result)
+        # the refusal mode is scoped to the threaded run, old behavior back
+        self.assertTrue(PythonAction.in_process_env_safe)
+
+    def test_cmd_actions_threads_isolated(self):
+        task_a = Task('env_cmd_a', [CMD_PRINT_ENV],
+                      env={'TZ': 'UTC', 'LC_ALL': 'C',
+                           'DOIT_ENV_MARKER_A': 'a'})
+        task_b = Task('env_cmd_b', [CMD_PRINT_ENV],
+                      env={'TZ': 'America/New_York',
+                           'LC_ALL': 'en_US.UTF-8',
+                           'DOIT_ENV_MARKER_B': 'b'})
+        self.assertEqual(runner.SUCCESS,
+                         self._run(runner.MThreadRunner, [task_a, task_b]))
+        import json
+        payloads = []
+        for task in (task_a, task_b):
+            line = task.actions[0].out.strip()
+            self.assertTrue(line.startswith('ENVJSON '))
+            payloads.append(json.loads(line[len('ENVJSON '):]))
+        self.assertIn({'TZ': 'UTC', 'LC_ALL': 'C',
+                       'MARKER_A': True, 'MARKER_B': False}, payloads)
+        self.assertIn({'TZ': 'America/New_York',
+                       'LC_ALL': 'en_US.UTF-8',
+                       'MARKER_A': False, 'MARKER_B': True}, payloads)
+        # parent process was never touched by subprocesses
+        self.assertNotIn('DOIT_ENV_MARKER_A', os.environ)
+        self.assertNotIn('DOIT_ENV_MARKER_B', os.environ)
+
+
+class TestRunnerEnvChangedRerun(DepManagerMixin, unittest.TestCase):
+    """changing one fingerprinted variable reruns only the matching task"""
+
+    def setUp(self):
+        super().setUp()
+        self.reporter = FakeReporter()
+        EnvRunnerCounters.task_a = 0
+        EnvRunnerCounters.task_b = 0
+
+    def _run_once(self, env_a, env_b):
+        from doit.tools import env_changed
+        task_a = Task('env_a', [_count_a],
+                      env=env_a, uptodate=[env_changed()])
+        task_b = Task('env_b', [_count_b],
+                      env=env_b, uptodate=[env_changed()])
+        my_runner = runner.Runner(self.dep_manager, self.reporter)
+        dispatcher = TaskDispatcher(
+            {'env_a': task_a, 'env_b': task_b}, [], ['env_a', 'env_b'])
+        my_runner.run_tasks(dispatcher)
+        self.assertEqual(runner.SUCCESS, my_runner.finish())
+
+    def test_only_changed_task_reruns(self):
+        env_a = {'TZ': 'UTC'}
+        env_b = {'LC_ALL': 'C'}
+        self._run_once(env_a, env_b)
+        self.assertEqual((1, 1), (EnvRunnerCounters.task_a,
+                                  EnvRunnerCounters.task_b))
+        # nothing changed: both are up-to-date
+        self._run_once(dict(env_a), dict(env_b))
+        self.assertEqual((1, 1), (EnvRunnerCounters.task_a,
+                                  EnvRunnerCounters.task_b))
+        # change only a variable participating in task A's fingerprint
+        self._run_once({'TZ': 'Europe/Berlin'}, dict(env_b))
+        self.assertEqual((2, 1), (EnvRunnerCounters.task_a,
+                                  EnvRunnerCounters.task_b))

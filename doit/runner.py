@@ -13,6 +13,7 @@ except ImportError:
 
 from .exceptions import InvalidTask, BaseFail
 from .exceptions import TaskFailed, SetupError, DependencyError, UnmetDependency
+from .action import PythonAction
 from .task import Stream, DelayedLoaded
 
 
@@ -174,6 +175,10 @@ class Runner():
         # register cleanup/teardown
         if task.teardown:
             self.teardown_list.append(task)
+
+        # create the fixed env snapshot used by all actions of this run
+        if task.env_spec is not None:
+            task.env_snapshot = task.env_spec.resolve()
 
         # finally execute it!
         self.reporter.execute_task(task)
@@ -575,3 +580,14 @@ class MThreadRunner(MRunner):
     @staticmethod
     def available():
         return True
+
+    def run_tasks(self, task_dispatcher):
+        # python-actions can not safely provide a task declared `env`
+        # when tasks run concurrently on threads of the same process,
+        # so they are refused instead of polluting sibling tasks
+        previous = PythonAction.in_process_env_safe
+        PythonAction.in_process_env_safe = False
+        try:
+            super().run_tasks(task_dispatcher)
+        finally:
+            PythonAction.in_process_env_safe = previous

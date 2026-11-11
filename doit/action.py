@@ -5,6 +5,7 @@ import os
 import sys
 import subprocess
 import io
+from contextlib import contextmanager
 from io import StringIO
 import inspect
 from pathlib import PurePath
@@ -12,6 +13,7 @@ from threading import Thread
 import pdb
 
 from .exceptions import InvalidTask, TaskFailed, TaskError
+from .task_env import env_unsafe_error
 
 
 def normalize_callable(ref):
@@ -182,6 +184,31 @@ class CmdAction(BaseAction):
                 realtime.flush()  # required if on byte buffering mode
 
 
+    def _build_env(self):
+        """build the subprocess environment for this action
+
+        Applies the task env declaration (fixed snapshot of the current
+        run) unless an explicit `env` pkwarg was given, which takes
+        precedence.  Handles the PYTHONUNBUFFERED setting used for
+        output buffering.
+        @return (env, remaining pkwargs without 'env')
+        """
+        subprocess_pkwargs = self.pkwargs.copy()
+        env = None
+        if 'env' in subprocess_pkwargs:
+            env = subprocess_pkwargs['env']
+            del subprocess_pkwargs['env']
+        # apply per-task env declaration (fixed snapshot of this run).
+        # explicit `env` pkwarg takes precedence over the task declaration.
+        task_snapshot = getattr(self.task, 'env_snapshot', None)
+        if task_snapshot is not None and env is None:
+            env = task_snapshot.environ
+        if self.buffering:
+            if not env:
+                env = os.environ.copy()
+            env['PYTHONUNBUFFERED'] = '1'
+        return env, subprocess_pkwargs
+
     def execute(self, out=None, err=None):
         """
         Execute command action
@@ -203,16 +230,7 @@ class CmdAction(BaseAction):
             return TaskError(
                 "CmdAction Error creating command string", exc)
 
-        # set environ to change output buffering
-        subprocess_pkwargs = self.pkwargs.copy()
-        env = None
-        if 'env' in subprocess_pkwargs:
-            env = subprocess_pkwargs['env']
-            del subprocess_pkwargs['env']
-        if self.buffering:
-            if not env:
-                env = os.environ.copy()
-            env['PYTHONUNBUFFERED'] = '1'
+        env, subprocess_pkwargs = self._build_env()
 
         capture_io = self.task.io.capture if self.task else True
         if capture_io:
@@ -382,8 +400,13 @@ class PythonAction(BaseAction):
     @ivar kwargs: (dict) Extra keyword arguments to be passed to py_callable
     @ivar task(Task): reference to task that contains this action
     @ivar pm_pdb: if True drop into PDB on exception when executing task
+    @cvar in_process_env_safe: if False a python-action can not provide
+           a task declared `env` (it would pollute concurrent tasks
+           running in the same process), so the action is refused.
+           Set to False by the threaded parallel runner.
     """
     pm_pdb = False
+    in_process_env_safe = True
 
     def __init__(self, py_callable, args=None, kwargs=None, task=None):
         # pylint: disable=W0231
@@ -426,6 +449,31 @@ class PythonAction(BaseAction):
         return BaseAction._prepare_kwargs(self.task, self.py_callable,
                                           self.args, self.kwargs)
 
+    @contextmanager
+    def _env_context(self):
+        """temporarily provide the task declared env to the python callable
+
+        python-actions run in-process, so this swaps os.environ for the
+        fixed task snapshot and always restores the parent environment
+        afterwards.  Callers must first check `in_process_env_safe`.
+        """
+        task_snapshot = getattr(self.task, 'env_snapshot', None)
+        if task_snapshot is None:
+            yield
+            return
+        saved_environ = os.environ.copy()
+        try:
+            for name in list(os.environ):
+                if name not in task_snapshot.environ:
+                    del os.environ[name]
+            os.environ.update(task_snapshot.environ)
+            yield
+        finally:
+            for name in list(os.environ):
+                if name not in saved_environ:
+                    del os.environ[name]
+            os.environ.update(saved_environ)
+
     def execute(self, out=None, err=None):
         """Execute command action
 
@@ -437,6 +485,12 @@ class PythonAction(BaseAction):
 
         @return failure: see CmdAction.execute
         """
+        # refuse early if the declared env can not be provided safely,
+        # before any stream redirection takes place
+        task_snapshot = getattr(self.task, 'env_snapshot', None)
+        if task_snapshot is not None and not self.in_process_env_safe:
+            return env_unsafe_error(self.task.name, self.py_callable)
+
         capture_io = self.task.io.capture if self.task else True
 
         if capture_io:
@@ -468,28 +522,30 @@ class PythonAction(BaseAction):
 
         kwargs = self._prepare_kwargs()
 
-        # execute action / callable
-        try:
-            returned_value = self.py_callable(*self.args, **kwargs)
-        except Exception as exception:
-            if self.pm_pdb:  # pragma: no cover
-                # start post-mortem debugger
-                deb = pdb.Pdb(stdin=sys.__stdin__, stdout=sys.__stdout__)
-                deb.reset()
-                deb.interaction(None, sys.exc_info()[2])
-            return TaskError("PythonAction Error", exception)
-        finally:
-            # restore std streams /log captured streams
-            if capture_io:
-                sys.stdout = old_stdout
-                sys.stderr = old_stderr
-                self.out = output.getvalue()
-                self.err = errput.getvalue()
-            else:
-                if out:
+        # execute action / callable with the task env temporarily applied
+        with self._env_context():
+            try:
+                returned_value = self.py_callable(*self.args, **kwargs)
+            except Exception as exception:
+                if self.pm_pdb:  # pragma: no cover
+                    # start post-mortem debugger
+                    deb = pdb.Pdb(stdin=sys.__stdin__,
+                                  stdout=sys.__stdout__)
+                    deb.reset()
+                    deb.interaction(None, sys.exc_info()[2])
+                return TaskError("PythonAction Error", exception)
+            finally:
+                # restore std streams / log captured streams
+                if capture_io:
                     sys.stdout = old_stdout
-                if err:
                     sys.stderr = old_stderr
+                    self.out = output.getvalue()
+                    self.err = errput.getvalue()
+                else:
+                    if out:
+                        sys.stdout = old_stdout
+                    if err:
+                        sys.stderr = old_stderr
 
         # if callable returns false. Task failed
         if returned_value is False:

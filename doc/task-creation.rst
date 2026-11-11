@@ -65,6 +65,27 @@ execution of the specified task in the `executed` param.
 
 .. literalinclude:: samples/delayed.py
 
+The tasks produced by a delayed *task-creator* are published as a single
+batch: the creator is fully evaluated and the whole batch is validated
+before any of its tasks becomes visible to the scheduler. If the creator
+raises an exception or the batch is invalid, none of its tasks is
+published and no action from it is executed. The error message identifies
+the *task-creator* and the involved tasks. A fixed *dodo* file can be
+executed again; nothing from the failed batch is kept around.
+
+The batch is rejected if:
+
+- a generated task name clashes with a task already defined (only the
+  placeholder of the delayed creator itself may be replaced)
+- a target is already owned by another task, or is shared by two tasks
+  from the same batch
+- a `task_dep`, `calc_dep` or `setup` references an unknown task
+- the batch introduces a cyclic dependency
+
+New dependency edges added at execution time by `calc_dep` results follow
+the same rules: they must reference existing tasks and must not create
+cycles.
+
 
 .. _specify-target-regex:
 

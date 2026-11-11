@@ -1,3 +1,4 @@
+import copy
 import unittest
 from collections import deque
 
@@ -348,7 +349,9 @@ class TestTaskDispatcher_node_add_wait_run(unittest.TestCase):
 
     def test_calc_dep_already_executed(self):
         tasks = {'t1': Task('t1', None, calc_dep=['t2']),
-                 't2': Task('t2', None)}
+                 't2': Task('t2', None),
+                 't3': Task('t3', None),
+                 't5': Task('t5', None)}
         td = TaskDispatcher(tasks, [], None)
         n1 = td._gen_node(None, 't1')
         n2 = td._gen_node(None, 't2')
@@ -654,6 +657,247 @@ class TestTaskDispatcher_add_task(unittest.TestCase):
         self.assertRaises(InvalidCommand, next, gen)
 
 
+class TestDelayedBatchPublication(unittest.TestCase):
+    """Delayed loaders publish their whole batch or nothing at all."""
+
+    def _dispatcher(self, creator, extra_tasks=(), executed=None,
+                    targets=None):
+        loader = DelayedLoader(creator, executed=executed)
+        tasks = {'late': Task('late', None, loader=loader)}
+        for name, task in extra_tasks:
+            tasks[name] = task
+        return TaskDispatcher(tasks, targets if targets is not None else {},
+                              ['late'])
+
+    @staticmethod
+    def _drive(td):
+        """consume a dispatcher returning names of dispatched ExecNodes"""
+        executed = []
+        node = None
+        while True:
+            try:
+                got = td.generator.send(node)
+            except StopIteration:
+                return executed
+            assert isinstance(got, ExecNode), got
+            node = got
+            executed.append(node.task.name)
+            node.run_status = 'successful'
+
+    def _batch_of_ten(self, last):
+        """generator with nine valid tasks and a custom 10th task"""
+        def creator():
+            for i in range(9):
+                yield {'name': f'gen{i}', 'actions': None,
+                       'targets': [f'gen{i}.txt']}
+            yield last
+        return creator
+
+    def test_duplicate_target_inside_batch(self):
+        """10th task reuses a target -> batch rejected, nothing published"""
+        creator = self._batch_of_ten(
+            {'name': 'gen9', 'actions': None, 'targets': ['gen0.txt']})
+        td = self._dispatcher(creator)
+        self.assertRaisesRegex(
+            InvalidTask, "late:gen0.*late:gen9.*gen0.txt", next,
+            td.generator)
+        self.assertEqual(['late'], list(td.tasks))
+        self.assertEqual({}, td.targets)
+
+    def test_target_owned_by_existing_task(self):
+        """target already owned by an existing task -> batch rejected"""
+        other = Task('other', None, targets=['gen5.txt'])
+        creator = self._batch_of_ten(
+            {'name': 'gen9', 'actions': None, 'targets': ['gen9.txt']})
+        td = self._dispatcher(creator, extra_tasks=[('other', other)],
+                              targets={'gen5.txt': 'other'})
+        self.assertRaisesRegex(
+            InvalidTask, "late:gen5.*gen5.txt.*other", next, td.generator)
+        self.assertEqual(['late', 'other'], list(td.tasks))
+        self.assertEqual({'gen5.txt': 'other'}, td.targets)
+
+    def test_name_conflict_with_existing_task(self):
+        """generated name already used by an existing task -> rejected"""
+        seed = Task('seed', None, targets=['seed.txt'])
+        creator = self._batch_of_ten(
+            {'basename': 'seed', 'actions': None, 'targets': ['gen9.txt']})
+        td = self._dispatcher(creator, extra_tasks=[('seed', seed)])
+        self.assertRaisesRegex(
+            InvalidTask, "late.*generated task 'seed'", next, td.generator)
+        self.assertEqual(['late', 'seed'], list(td.tasks))
+        self.assertEqual(['seed.txt'], td.tasks['seed'].targets)
+
+    def test_generator_raises_on_last_task(self):
+        """exception on 10th task -> batch rejected, loader not consumed"""
+        def creator():
+            for i in range(9):
+                yield {'name': f'gen{i}', 'actions': None,
+                       'targets': [f'gen{i}.txt']}
+            raise RuntimeError('boom on 10th')
+
+        td = self._dispatcher(creator)
+        self.assertRaisesRegex(InvalidTask, "late.*RuntimeError.*boom", next,
+                               td.generator)
+        self.assertEqual(['late'], list(td.tasks))
+        self.assertEqual({}, td.targets)
+        # loader was not marked as consumed so a fixed generator can be
+        # used on the next execution
+        self.assertFalse(td.tasks['late'].loader.created)
+
+    def test_unknown_task_dep(self):
+        """unknown dependency reported instead of KeyError"""
+        creator = self._batch_of_ten(
+            {'name': 'gen9', 'actions': None, 'task_dep': ['typo']})
+        td = self._dispatcher(creator)
+        self.assertRaisesRegex(
+            InvalidTask, "late:gen9.*unknown task dependency 'typo'",
+            next, td.generator)
+        self.assertEqual(['late'], list(td.tasks))
+
+    def test_unknown_calc_dep(self):
+        creator = self._batch_of_ten(
+            {'name': 'gen9', 'actions': None, 'calc_dep': ['typo']})
+        td = self._dispatcher(creator)
+        self.assertRaisesRegex(
+            InvalidTask, "late:gen9.*unknown calc dependency 'typo'",
+            next, td.generator)
+
+    def test_unknown_setup_task(self):
+        creator = self._batch_of_ten(
+            {'name': 'gen9', 'actions': None, 'setup': ['typo']})
+        td = self._dispatcher(creator)
+        self.assertRaisesRegex(
+            InvalidTask, "late:gen9.*unknown setup task 'typo'",
+            next, td.generator)
+
+    def test_cycle_inside_batch(self):
+        """cycle introduced by the batch is reported, no deadlock"""
+        def creator():
+            yield {'name': 'gen0', 'actions': None, 'task_dep': ['late:gen1']}
+            yield {'name': 'gen1', 'actions': None, 'task_dep': ['late:gen0']}
+
+        td = self._dispatcher(creator)
+        with self.assertRaises(InvalidTask) as cm:
+            next(td.generator)
+        message = str(cm.exception)
+        self.assertIn('cyclic dependencies', message)
+        self.assertIn('late:gen0', message)
+        self.assertIn('late:gen1', message)
+        self.assertEqual(['late'], list(td.tasks))
+
+    def test_cycle_through_existing_task(self):
+        """cycle closed by an implicit file_dep on an existing task"""
+        existing = Task('existing', None, file_dep=['gen0.txt'],
+                        targets=['existing.txt'])
+
+        def cyclic():
+            for i in range(9):
+                yield {'name': f'gen{i}', 'actions': None,
+                       'targets': [f'gen{i}.txt'],
+                       'task_dep': ['existing'] if i == 0 else []}
+            yield {'name': 'gen9', 'actions': None,
+                   'targets': ['gen9.txt'], 'task_dep': ['existing']}
+
+        # gen0 -> existing -> (implicit) gen0 forms a cycle
+        td = self._dispatcher(cyclic, extra_tasks=[('existing', existing)])
+        self.assertRaisesRegex(InvalidTask, "cyclic dependencies", next,
+                               td.generator)
+
+    def test_successful_publication(self):
+        """valid batch is published as a whole"""
+        creator = self._batch_of_ten(
+            {'name': 'gen9', 'actions': None, 'targets': ['gen9.txt']})
+        td = self._dispatcher(creator)
+        loader = td.tasks['late'].loader
+        executed = self._drive(td)
+        self.assertEqual(
+            {'late'} | {f'late:gen{i}' for i in range(10)}, set(executed))
+        # every generated task was dispatched exactly once
+        self.assertEqual(11, len(executed))
+        self.assertEqual(10, len(td.targets))
+        self.assertTrue(loader.created)
+
+    def test_wild_dep_expanded_at_publication(self):
+        """wild-card task_deps from the batch are expanded, no deadlock"""
+        def creator():
+            yield {'name': 'gen0', 'actions': None,
+                   'task_dep': ['pre*']}
+
+        pre = Task('pre_a', None)
+        td = self._dispatcher(creator, extra_tasks=[('pre_a', pre)])
+        executed = self._drive(td)
+        self.assertEqual(['pre_a', 'late:gen0', 'late'], executed)
+        self.assertEqual(['pre_a'], td.tasks['late:gen0'].task_dep)
+
+    def test_placeholder_name_may_be_replaced(self):
+        """the group task created for sub-tasks replaces its placeholder"""
+        creator = self._batch_of_ten(
+            {'name': 'gen9', 'actions': None, 'targets': ['gen9.txt']})
+        td = self._dispatcher(creator)
+        next(td.generator)
+        self.assertTrue(td.tasks['late'].has_subtask)
+        self.assertIn('late:gen0', td.tasks['late'].task_dep)
+
+    def test_creates_placeholders_all_replaceable(self):
+        """`creates` uses a loader copy per placeholder, all replaceable"""
+        def creator():
+            yield {'basename': 'b', 'actions': None,
+                   'targets': ['b.txt']}
+            yield {'basename': 'c', 'actions': None,
+                   'targets': ['c.txt']}
+
+        base_loader = DelayedLoader(creator)
+        b_loader = copy.copy(base_loader)
+        c_loader = copy.copy(base_loader)
+        tasks = {'a': Task('a', None),
+                 'b': Task('b', None, loader=b_loader),
+                 'c': Task('c', None, loader=c_loader)}
+        td = TaskDispatcher(tasks, {}, ['b', 'c'])
+        dispatched = self._drive(td)
+        self.assertEqual(['b', 'c'], dispatched)
+        self.assertEqual({'b.txt': 'b', 'c.txt': 'c'}, td.targets)
+
+    def test_calc_dep_new_edge_unknown(self):
+        """new edges from calc_dep are validated like a batch"""
+        tasks = {'t1': Task('t1', None, calc_dep=['calc']),
+                 'calc': Task('calc', None)}
+        td = TaskDispatcher(tasks, {}, None)
+        n1 = td._gen_node(None, 't1')
+        n2 = td._gen_node(None, 'calc')
+        n2.run_status = 'done'
+        n2.task.values = {'task_dep': ['typo']}
+        self.assertRaisesRegex(InvalidTask, "calc.*unknown dependency 'typo'",
+                               td._node_add_wait_run, n1, ['calc'], True)
+        self.assertEqual([], n1.task_dep)
+
+    def test_calc_dep_new_edge_cycle(self):
+        """calc_dep creating a cycle is rejected"""
+        tasks = {'t1': Task('t1', None, calc_dep=['calc']),
+                 'calc': Task('calc', None, task_dep=['t1'])}
+        td = TaskDispatcher(tasks, {}, None)
+        n1 = td._gen_node(None, 't1')
+        n2 = td._gen_node(None, 'calc')
+        n2.run_status = 'done'
+        n2.task.values = {'task_dep': ['calc']}
+        self.assertRaisesRegex(InvalidTask, "calc.*cyclic dependencies",
+                               td._node_add_wait_run, n1, ['calc'], True)
+
+    def test_calc_dep_edge_to_done_task_not_rerun(self):
+        """edge to an already successful task is not scheduled again"""
+        tasks = {'t1': Task('t1', None, calc_dep=['calc']),
+                 'calc': Task('calc', None),
+                 'done_task': Task('done_task', None)}
+        td = TaskDispatcher(tasks, {}, ['t1'])
+        # done_task already executed successfully in a previous run
+        n3 = td._gen_node(None, 'done_task')
+        n3.run_status = 'done'
+        # calc task produces a new edge to done_task
+        tasks['calc'].values = {'task_dep': ['done_task']}
+        executed = self._drive(td)
+        self.assertEqual(['calc', 't1'], executed)
+        self.assertIn('done_task', tasks['t1'].task_dep)
+
+
 class TestTaskDispatcher_get_next_node(unittest.TestCase):
 
     def test_none(self):
@@ -737,7 +981,8 @@ class TestTaskDispatcher_update_waiting(unittest.TestCase):
         tasks = {'t1': Task('t1', None, calc_dep=['t2'], task_dep=['t4']),
                  't2': Task('t2', None),
                  't3': Task('t3', None),
-                 't4': Task('t4', None)}
+                 't4': Task('t4', None),
+                 't5': Task('t5', None)}
         td = TaskDispatcher(tasks, [], None)
         n1 = td._gen_node(None, 't1')
         n1_gen = td._add_task(n1)

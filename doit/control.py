@@ -5,7 +5,7 @@ from collections import OrderedDict
 import re
 
 from .exceptions import InvalidTask, InvalidCommand, InvalidDodoFile
-from .task import Task, DelayedLoaded
+from .task import Task, DelayedLoader, DelayedLoaded
 from .loader import generate_tasks
 
 
@@ -126,6 +126,142 @@ class TaskControl:
         for dep in deps_list:
             if (dep in targets and targets[dep] not in task.task_dep):
                 task.task_dep.append(targets[dep])
+
+
+    @staticmethod
+    def _validate_batch(tasks, targets, new_tasks, source, replaceable):
+        """Validate a batch of delayed-created tasks as a single unit.
+
+        The batch is only published (made visible to the scheduler) after
+        the whole batch was collected and passed all checks. This method
+        must not modify `tasks` nor `targets`, so on failure the original
+        task graph is left untouched and remains executable.
+
+        @param tasks: (dict) name -> Task, tasks already on the graph
+        @param targets: (dict) fileName -> task_name, known target owners
+        @param new_tasks: (list - Task) tasks from a single delayed loader
+        @param source: (str) name identifying the loader that created them
+        @param replaceable: (set - str) names of placeholder tasks that
+               this batch is allowed to replace
+        @raises InvalidTask: if the batch is invalid
+        """
+        # 1) task names must be unique within the batch and must not clash
+        #    with tasks already on the graph, except for placeholders that
+        #    the batch is expected to replace.
+        batch_names = set()
+        for task in new_tasks:
+            if task.name in batch_names:
+                msg = ("Delayed task creation '%s' generated duplicated "
+                       "task '%s'.")
+                raise InvalidTask(msg % (source, task.name))
+            batch_names.add(task.name)
+            if task.name in tasks and task.name not in replaceable:
+                msg = ("Delayed task creation '%s' generated task '%s' "
+                       "but this name is already used by another task.")
+                raise InvalidTask(msg % (source, task.name))
+
+        # 2) every target must have a single owner, considering both
+        #    targets already on the graph and targets within the batch.
+        batch_targets = {}
+        for task in new_tasks:
+            for target in task.targets:
+                if target in targets:
+                    msg = ("Delayed task creation '%s' generated task '%s' "
+                           "with target '%s' but it is already a target "
+                           "of task '%s'.")
+                    raise InvalidTask(
+                        msg % (source, task.name, target, targets[target]))
+                if target in batch_targets:
+                    msg = ("Delayed task creation '%s' generated tasks '%s' "
+                           "and '%s' with the same target '%s'.")
+                    raise InvalidTask(msg % (source, batch_targets[target],
+                                             task.name, target))
+                batch_targets[target] = task.name
+
+        # 3) expand wild-card task-dependencies using the final graph
+        #    (existing tasks plus the batch being published).
+        final_order = list(tasks) + list(batch_names)
+        for task in new_tasks:
+            for pattern in task.wild_dep:
+                for name in final_order:
+                    if fnmatch.fnmatch(name, pattern) and \
+                            name not in task.task_dep:
+                        task.task_dep.append(name)
+            task.wild_dep = []
+
+        # 4) dependencies must reference tasks that will exist once the
+        #    batch is published (existing graph plus the batch itself).
+        for task in new_tasks:
+            for dep in task.task_dep:
+                if dep not in tasks and dep not in batch_names:
+                    msg = ("Delayed task creation '%s' generated task '%s' "
+                           "with an unknown task dependency '%s'.")
+                    raise InvalidTask(msg % (source, task.name, dep))
+            for dep in task.calc_dep:
+                if dep not in tasks and dep not in batch_names:
+                    msg = ("Delayed task creation '%s' generated task '%s' "
+                           "with an unknown calc dependency '%s'.")
+                    raise InvalidTask(msg % (source, task.name, dep))
+            for setup_task in task.setup_tasks:
+                if setup_task not in tasks and setup_task not in batch_names:
+                    msg = ("Delayed task creation '%s' generated task '%s' "
+                           "with an unknown setup task '%s'.")
+                    raise InvalidTask(msg % (source, task.name, setup_task))
+
+        # 5) the batch must not introduce cyclic dependencies.
+        #    implicit task_deps from file_deps are computed on local
+        #    copies so no task object is modified before publication.
+        local_targets = dict(targets)
+        local_targets.update(batch_targets)
+        edges = {}
+        for name, task in tasks.items():
+            implicit = [local_targets[dep] for dep in task.file_dep
+                        if dep in local_targets]
+            edges[name] = list(task.task_dep) + implicit
+        for task in new_tasks:
+            implicit = [local_targets[dep] for dep in task.file_dep
+                        if dep in local_targets]
+            edges[task.name] = list(task.task_dep) + implicit
+        cycle = TaskControl._find_cycle(batch_names, edges)
+        if cycle:
+            msg = ("Delayed task creation '%s' introduces cyclic "
+                   "dependencies: %s")
+            raise InvalidTask(msg % (source, " -> ".join(cycle)))
+
+
+    @staticmethod
+    def _find_cycle(roots, edges):
+        """find a cyclic dependency path reachable from one of `roots`
+
+        @param roots: (iterable - str) task names the search starts from
+        @param edges: (dict) name -> list of task_dep names
+        @return (list - str) names forming the cycle, None if acyclic
+        """
+        visited = set()   # nodes on finished (acyclic) paths
+        in_stack = set()  # nodes on the current DFS path
+        stack = []
+
+        def visit(name):
+            if name in visited:
+                return None
+            if name in in_stack:
+                return stack[stack.index(name):] + [name]
+            in_stack.add(name)
+            stack.append(name)
+            for dep in edges.get(name, ()):
+                cycle = visit(dep)
+                if cycle:
+                    return cycle
+            stack.pop()
+            in_stack.remove(name)
+            visited.add(name)
+            return None
+
+        for name in roots:
+            cycle = visit(name)
+            if cycle:
+                return cycle
+        return None
 
 
     def _get_wild_tasks(self, pattern):
@@ -469,13 +605,46 @@ class TaskDispatcher:
             to_load = this_task.loader.basename or this_task.name
             this_loader = self.tasks[to_load].loader
             if this_loader and not this_loader.created:
-                task_gen = ref(**this_loader.kwargs) if this_loader.kwargs else ref()
-                new_tasks = generate_tasks(to_load, task_gen, ref.__doc__)
+                # fully collect the batch first; an exception from the
+                # generator aborts publication without touching the graph
+                try:
+                    if this_loader.kwargs:
+                        task_gen = ref(**this_loader.kwargs)
+                    else:
+                        task_gen = ref()
+                    new_tasks = generate_tasks(to_load, task_gen, ref.__doc__)
+                except InvalidTask:
+                    raise
+                except Exception as exception:
+                    msg = ("Delayed task creation '%s' failed to generate "
+                           "tasks: %s: %s")
+                    raise InvalidTask(msg % (to_load,
+                                             exception.__class__.__name__,
+                                             exception)) from exception
+                # placeholders created by this same loader are the only
+                # tasks the batch is allowed to replace. `creates` uses a
+                # copy of the DelayedLoader per placeholder, so compare
+                # by creator identity instead of loader identity.
+                replaceable = {
+                    name for name, task in self.tasks.items()
+                    if isinstance(task.loader, DelayedLoader)
+                    and task.loader.creator is this_loader.creator}
+                # validate the whole batch before anything is published;
+                # on failure self.tasks/self.targets are left untouched,
+                # so the loader is not marked as consumed and may be
+                # re-run on a later (fixed) execution.
+                TaskControl._validate_batch(
+                    self.tasks, self.targets, new_tasks,
+                    to_load, replaceable)
+                # transaction commit: the batch is fully visible only now
                 TaskControl.set_implicit_deps(self.targets, new_tasks)
                 for nt in new_tasks:
                     if not nt.loader:
                         nt.loader = DelayedLoaded
                     self.tasks[nt.name] = nt
+                # the generator is consumed once, never rely on re-running
+                # the loader to recover state
+                this_loader.created = True
             # check itself for implicit dep (used by regex_target)
             TaskControl.add_implicit_task_dep(
                 self.targets, this_task, this_task.file_dep)
@@ -597,12 +766,47 @@ class TaskDispatcher:
             self.targets, waiting_node.task,
             values.get('file_dep', []))
 
-        # update node's list of non-processed dependencies
+        # new edges created by calc_dep follow the same publication rules
+        # as delayed-created tasks: they must reference existing tasks and
+        # must not introduce cyclic dependencies.
         new_task_dep = waiting_node.task.task_dep[len_task_deps:]
-        waiting_node.task_dep.extend(new_task_dep)
         new_calc_dep = waiting_node.task.calc_dep - old_calc_dep
+        self._validate_calc_dep_edges(node, waiting_node,
+                                      new_task_dep, new_calc_dep)
+
+        # update node's list of non-processed dependencies
+        waiting_node.task_dep.extend(new_task_dep)
         waiting_node.calc_dep.update(new_calc_dep)
 
+
+    def _validate_calc_dep_edges(self, node, waiting_node,
+                                 new_task_dep, new_calc_dep):
+        """validate new dependency edges created by a calc_dep result
+
+        @param node: (ExecNode) the calc_dep task that produced the values
+        @param waiting_node: (ExecNode) task receiving the new dependencies
+        @raises InvalidTask: on unknown dependency or cyclic dependency
+        """
+        task = waiting_node.task
+        for dep in list(new_task_dep) + list(new_calc_dep):
+            if dep not in self.tasks:
+                msg = ("calc_dep '%s' added an unknown dependency '%s' "
+                       "to task '%s'.")
+                raise InvalidTask(msg % (node.task.name, dep, task.name))
+
+        # check for cycles on the updated graph, starting from the
+        # task that received the new edges
+        edges = {}
+        for name, a_task in self.tasks.items():
+            implicit = [self.targets[dep] for dep in a_task.file_dep
+                        if dep in self.targets]
+            edges[name] = list(a_task.task_dep) + implicit
+        cycle = TaskControl._find_cycle([task.name], edges)
+        if cycle:
+            msg = ("calc_dep '%s' introduces cyclic dependencies "
+                   "on task '%s': %s")
+            raise InvalidTask(
+                msg % (node.task.name, task.name, " -> ".join(cycle)))
 
 
     def _dispatcher_generator(self, selected_tasks):

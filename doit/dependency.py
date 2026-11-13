@@ -1,7 +1,9 @@
 """Manage (save/check) task dependency-on-files data."""
 
 import os
+import fnmatch
 import hashlib
+import stat
 import subprocess
 import inspect
 import json
@@ -437,6 +439,124 @@ CHECKERS = {'md5': MD5Checker,
             'timestamp': TimestampChecker}
 
 
+class DirDep:
+    """Specification of a dependency on the content of a directory.
+
+    The directory is scanned and the state of every selected member is
+    saved after a successful task execution. On subsequent checks the
+    directory is re-scanned and compared against the saved snapshot:
+    added, removed or modified members make the task not up-to-date.
+    Members that do not match `patterns` never affect the task status.
+
+    Scan results are recorded with normalized relative paths (relative
+    to `root`, using '/' as separator).
+
+    Defined behaviors:
+
+    * empty directory (no selected member): a valid, empty snapshot.
+      Adding a matching file later is detected as an addition.
+    * broken symbolic links: recorded as members with a special state,
+      so their appearance, removal or repair is detected.
+    * cyclic links (only possible with ``follow_links=True``): each
+      real directory is scanned only once, cycles are silently skipped.
+    * a missing `root` directory is scanned as an empty directory.
+
+    :ivar str root: path of the directory to be scanned (absolute)
+    :ivar tuple patterns: fnmatch patterns matched against the member's
+         relative path. Note ``*`` also matches path separators, so
+         ``*.txt`` matches files in sub-directories as well.
+    :ivar bool recursive: if True scan sub-directories
+    :ivar bool follow_links: if True follow symbolic links to directories.
+         File symlinks are always resolved to their target's state.
+    """
+
+    #: state recorded for members that are broken symbolic links
+    BROKEN_LINK = '<broken-symlink>'
+
+    def __init__(self, root, patterns=('*',), recursive=True,
+                 follow_links=False):
+        if isinstance(patterns, str):
+            patterns = (patterns,)
+        self.root = os.path.abspath(str(root))
+        self.patterns = tuple(patterns)
+        self.recursive = bool(recursive)
+        self.follow_links = bool(follow_links)
+
+    def __repr__(self):
+        return (f"DirDep({self.root!r}, patterns={self.patterns!r}, "
+                f"recursive={self.recursive!r}, "
+                f"follow_links={self.follow_links!r})")
+
+    @property
+    def db_key(self):
+        """key used to save this dependency's snapshot on the DB"""
+        return 'dir_dep:' + self.root
+
+    def spec(self):
+        """serializable spec, a snapshot is invalid if the spec changes"""
+        return [list(self.patterns), self.recursive, self.follow_links]
+
+    def match(self, rel_path):
+        """@return bool: True if member with given relative path is selected"""
+        return any(fnmatch.fnmatchcase(rel_path, pattern)
+                   for pattern in self.patterns)
+
+    def scan(self, checker):
+        """Scan the directory computing the state of selected members.
+
+        :param checker: (FileChangedChecker) used to compute file states
+        :return dict: normalized relative path -> state from
+                      ``checker.get_state()`` or ``DirDep.BROKEN_LINK``
+        """
+        result = {}
+        visited = set()  # (device, inode) of already scanned directories
+
+        def add_member(path):
+            rel_path = os.path.relpath(path, self.root).replace(os.sep, '/')
+            if not self.match(rel_path):
+                return
+            result[rel_path] = checker.get_state(path, None)
+
+        def walk(dir_path):
+            try:
+                dir_stat = os.stat(dir_path)
+            except OSError:
+                return
+            dir_id = (dir_stat.st_dev, dir_stat.st_ino)
+            if dir_id in visited:
+                return  # cyclic link, directory was already scanned
+            visited.add(dir_id)
+            try:
+                entries = sorted(os.scandir(dir_path),
+                                 key=lambda entry: entry.name)
+            except OSError:
+                return
+            for entry in entries:
+                if entry.is_symlink():
+                    try:
+                        target_stat = entry.stat()
+                    except OSError:
+                        # broken link is a member on its own
+                        rel_path = os.path.relpath(
+                            entry.path, self.root).replace(os.sep, '/')
+                        if self.match(rel_path):
+                            result[rel_path] = self.BROKEN_LINK
+                    else:
+                        if stat.S_ISDIR(target_stat.st_mode):
+                            if self.recursive and self.follow_links:
+                                walk(entry.path)
+                        else:
+                            add_member(entry.path)
+                elif entry.is_dir(follow_symlinks=False):
+                    if self.recursive:
+                        walk(entry.path)
+                else:
+                    add_member(entry.path)
+
+        walk(self.root)
+        return result
+
+
 class DependencyStatus:
     """Result object for Dependency.get_status.
 
@@ -547,6 +667,19 @@ class Dependency:
         # save list of file_deps
         self._set(task.name, 'deps:', tuple(task.file_dep))
 
+        # dir-dep
+        checked_scans = getattr(task, '_dir_dep_scans', {})
+        for dir_dep in task.dir_dep:
+            current = dir_dep.scan(self.checker)
+            checked = checked_scans.get(dir_dep.db_key)
+            if checked is not None and checked != current:
+                # Directory changed while the task was running, the scan
+                # is unstable. Do not save it as a successful snapshot,
+                # the previous successful snapshot (if any) is kept.
+                continue
+            self._set(task.name, dir_dep.db_key,
+                      {'spec': dir_dep.spec(), 'files': current})
+
     def get_values(self, task_name):
         """get all saved values from a task
 
@@ -653,7 +786,7 @@ class Dependency:
             return result
 
         # no dependencies means it is never up to date.
-        if not (task.file_dep or uptodate_result_list):
+        if not (task.file_dep or task.dir_dep or uptodate_result_list):
             if result.set_reason('has_no_dependencies', True):
                 return result
 
@@ -705,9 +838,62 @@ class Dependency:
         task.dep_changed = changed
 
         if len(changed) > 0:
-            result.set_reason('changed_file_dep', changed)
+            if result.set_reason('changed_file_dep', changed):
+                return result
+
+        # check for modified dir_dep
+        if task.dir_dep:
+            if self._check_dir_dep(task, result):
+                return result
 
         return result
+
+    def _check_dir_dep(self, task, result):
+        """Check directory dependencies, updating the DependencyStatus.
+
+        The scans are cached on the task so ``save_success()`` can detect
+        changes that happen while the task is running.
+
+        :return bool: True if processing should be interrupted
+        """
+        scans = {}
+        task._dir_dep_scans = scans
+        for dir_dep in task.dir_dep:
+            scan = dir_dep.scan(self.checker)
+            scans[dir_dep.db_key] = scan
+            saved = self._get(task.name, dir_dep.db_key)
+            if saved is None:
+                if result.add_reason('dir_dep_no_previous', dir_dep.root):
+                    return True
+                continue
+            if saved.get('spec') != dir_dep.spec():
+                if result.add_reason('dir_dep_spec_changed', dir_dep.root):
+                    return True
+                continue
+            saved_files = saved['files']
+            for rel_path in sorted(set(scan) - set(saved_files)):
+                path = os.path.join(dir_dep.root, rel_path)
+                if result.add_reason('dir_dep_added', path):
+                    return True
+            for rel_path in sorted(set(saved_files) - set(scan)):
+                path = os.path.join(dir_dep.root, rel_path)
+                if result.add_reason('dir_dep_removed', path):
+                    return True
+            for rel_path in sorted(set(scan) & set(saved_files)):
+                new_state = scan[rel_path]
+                old_state = saved_files[rel_path]
+                if DirDep.BROKEN_LINK in (new_state, old_state):
+                    modified = new_state != old_state
+                else:
+                    path = os.path.join(dir_dep.root, rel_path)
+                    file_stat = self.checker.info(path)
+                    modified = self.checker.check_modified(
+                        path, file_stat, old_state)
+                if modified:
+                    path = os.path.join(dir_dep.root, rel_path)
+                    if result.add_reason('dir_dep_changed', path):
+                        return True
+        return False
 
 
 

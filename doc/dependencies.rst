@@ -80,8 +80,10 @@ A task is **not** up-to-date if any of:
   * an :ref:`uptodate <attr-uptodate>` item is (or evaluates to) `False`
   * a file is added to or removed from `file_dep`
   * a `file_dep` changed since last successful execution
+  * a member of a :ref:`dir_dep <dir-dep>` was added, removed or changed
+    since last successful execution
   * a `target` path does not exist
-  * a task has no `file_dep` and `uptodate` item equal to `True`
+  * a task has no `file_dep`, no `dir_dep` and `uptodate` item equal to `True`
 
 It means that if a task does not explicitly define any *input* (dependency)
 it will never be considered `up-to-date`.
@@ -408,6 +410,5 @@ from a module. The dependencies itself are calculated on task ``get_dep``
 
 
 .. literalinclude:: samples/calc_dep.py
-
 
 

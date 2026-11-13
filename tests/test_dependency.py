@@ -12,6 +12,7 @@ import unittest
 from doit.task import Task
 from doit.dependency import get_md5, get_file_md5
 from doit.dependency import DbmDB, Dependency
+from doit.dependency import DirDep
 from doit.dependency import DatabaseException, UptodateCalculator
 from doit.dependency import FileChangedChecker, MD5Checker, TimestampChecker
 from doit.dependency import DependencyStatus
@@ -911,4 +912,360 @@ class TestGetStatusDbmNdbm(DependencyTestBase, _GetStatusTests, unittest.TestCas
     backend_name = 'dbm.ndbm'
 
 class TestGetStatusDbmDumb(DependencyTestBase, _GetStatusTests, unittest.TestCase):
+    backend_name = 'dbm.dumb'
+
+
+# ---------------------------------------------------------------------------
+# TestDirDep
+# ---------------------------------------------------------------------------
+
+class _DirDepTests:
+    """Tests for directory dependencies (DirDep)."""
+
+    def setUp(self):
+        super().setUp()
+        self._dir_tmp = tempfile.mkdtemp(prefix='doit-test-dirdep-')
+        self.root = os.path.join(self._dir_tmp, 'root')
+        os.makedirs(self.root)
+        # monotonic mtimes so content changes are always detected
+        self._mtime = time.time() - 100
+
+    def tearDown(self):
+        shutil.rmtree(self._dir_tmp, ignore_errors=True)
+        super().tearDown()
+
+    def _write(self, rel_path, content='data'):
+        path = os.path.join(self.root, rel_path)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'w') as file_out:
+            file_out.write(content)
+        self._mtime += 1
+        os.utime(path, (self._mtime, self._mtime))
+        return path
+
+    def _remove(self, rel_path):
+        os.remove(os.path.join(self.root, rel_path))
+
+    def _make_task(self, name='t1', actions=None, **dir_kwargs):
+        spec = DirDep(self.root, **dir_kwargs)
+        return Task(name, actions, dir_dep=[spec])
+
+    def _run_if_needed(self, task):
+        """simulate a runner: execute actions if not up-to-date"""
+        result = self.dep_manager.get_status(task, {}, get_log=True)
+        if result.status == 'run':
+            task.options = {}
+            for action in task.actions:
+                action.execute()
+            self.dep_manager.save_success(task)
+        return result
+
+    # -- basic scan/snapshot behavior
+
+    def test_first_run_then_up_to_date(self):
+        self._write('a.txt')
+        t1 = self._make_task()
+        result = self.dep_manager.get_status(t1, {}, get_log=True)
+        self.assertEqual('run', result.status)
+        self.assertEqual([t1.dir_dep[0].root],
+                         result.reasons['dir_dep_no_previous'])
+
+        self.dep_manager.save_success(t1)
+        result = self.dep_manager.get_status(t1, {}, get_log=True)
+        self.assertEqual('up-to-date', result.status)
+        # repeated checks keep the last successful state
+        result = self.dep_manager.get_status(t1, {}, get_log=True)
+        self.assertEqual('up-to-date', result.status)
+
+    def test_snapshot_uses_normalized_relative_paths(self):
+        self._write('a.txt')
+        self._write('sub/b.txt')
+        t1 = self._make_task()
+        self.dep_manager.get_status(t1, {})
+        self.dep_manager.save_success(t1)
+        saved = self.dep_manager._get('t1', t1.dir_dep[0].db_key)
+        self.assertEqual({'a.txt', 'sub/b.txt'}, set(saved['files']))
+        self.assertEqual([['*'], True, False], saved['spec'])
+
+    def test_empty_dir_is_valid_snapshot(self):
+        t1 = self._make_task()
+        self.assertEqual('run', self.dep_manager.get_status(t1, {}).status)
+        self.dep_manager.save_success(t1)
+        self.assertEqual('up-to-date',
+                         self.dep_manager.get_status(t1, {}).status)
+        # adding a matching file to the empty dir is detected
+        added = self._write('new.txt')
+        result = self.dep_manager.get_status(t1, {}, get_log=True)
+        self.assertEqual('run', result.status)
+        self.assertEqual([added], result.reasons['dir_dep_added'])
+
+    # -- add / remove / change / replace
+
+    def test_add_remove_change_cycle(self):
+        path_a = self._write('a.txt')
+        t1 = self._make_task()
+        self.dep_manager.get_status(t1, {})
+        self.dep_manager.save_success(t1)
+
+        # add
+        path_b = self._write('b.txt')
+        result = self.dep_manager.get_status(t1, {}, get_log=True)
+        self.assertEqual('run', result.status)
+        self.assertEqual([path_b], result.reasons['dir_dep_added'])
+        self.dep_manager.save_success(t1)
+        self.assertEqual('up-to-date',
+                         self.dep_manager.get_status(t1, {}).status)
+
+        # remove
+        self._remove('a.txt')
+        result = self.dep_manager.get_status(t1, {}, get_log=True)
+        self.assertEqual('run', result.status)
+        self.assertEqual([path_a], result.reasons['dir_dep_removed'])
+        self.dep_manager.save_success(t1)
+        self.assertEqual('up-to-date',
+                         self.dep_manager.get_status(t1, {}).status)
+
+        # content change
+        self._write('b.txt', 'other content')
+        result = self.dep_manager.get_status(t1, {}, get_log=True)
+        self.assertEqual('run', result.status)
+        self.assertEqual([path_b], result.reasons['dir_dep_changed'])
+        self.dep_manager.save_success(t1)
+        self.assertEqual('up-to-date',
+                         self.dep_manager.get_status(t1, {}).status)
+
+        # replace (delete + recreate with different content)
+        self._remove('b.txt')
+        self._write('b.txt', 'replaced')
+        result = self.dep_manager.get_status(t1, {}, get_log=True)
+        self.assertEqual('run', result.status)
+        self.assertEqual([path_b], result.reasons['dir_dep_changed'])
+
+    def test_unselected_files_do_not_affect_status(self):
+        self._write('a.txt')
+        t1 = self._make_task(patterns=('*.txt',))
+        self.dep_manager.get_status(t1, {})
+        self.dep_manager.save_success(t1)
+
+        # add/remove/change files not matching the pattern
+        self._write('b.bin')
+        self._write('sub/c.bin')
+        self.assertEqual('up-to-date',
+                         self.dep_manager.get_status(t1, {}).status)
+        self._write('b.bin', 'changed')
+        self.assertEqual('up-to-date',
+                         self.dep_manager.get_status(t1, {}).status)
+        self._remove('b.bin')
+        self.assertEqual('up-to-date',
+                         self.dep_manager.get_status(t1, {}).status)
+
+        # but a matching file is detected
+        self._write('sub/c.txt')
+        result = self.dep_manager.get_status(t1, {}, get_log=True)
+        self.assertEqual('run', result.status)
+        self.assertEqual([os.path.join(self.root, 'sub/c.txt')],
+                         result.reasons['dir_dep_added'])
+
+    def test_recursive_option(self):
+        self._write('sub/a.txt')
+        # non-recursive does not see files in sub-directories
+        t1 = self._make_task(recursive=False)
+        self.dep_manager.get_status(t1, {})
+        self.dep_manager.save_success(t1)
+        self.assertEqual('up-to-date',
+                         self.dep_manager.get_status(t1, {}).status)
+        # recursive task with same root sees the file (different spec)
+        t2 = self._make_task(name='t2', recursive=True)
+        result = self.dep_manager.get_status(t2, {}, get_log=True)
+        self.assertEqual('run', result.status)
+        self.assertEqual([self.root], result.reasons['dir_dep_no_previous'])
+        self.dep_manager.save_success(t2)
+        saved = self.dep_manager._get('t2', t2.dir_dep[0].db_key)
+        self.assertEqual({'sub/a.txt'}, set(saved['files']))
+
+    def test_spec_change_triggers_run(self):
+        self._write('a.txt')
+        t1 = self._make_task()
+        self.dep_manager.get_status(t1, {})
+        self.dep_manager.save_success(t1)
+
+        t2 = self._make_task(patterns=('*.txt',))
+        result = self.dep_manager.get_status(t2, {}, get_log=True)
+        self.assertEqual('run', result.status)
+        self.assertEqual([self.root], result.reasons['dir_dep_spec_changed'])
+
+    # -- symlinks
+
+    def test_broken_symlink_is_tracked(self):
+        self._write('a.txt')
+        broken = os.path.join(self.root, 'broken.txt')
+        os.symlink('non-existent-target', broken)
+        t1 = self._make_task()
+        self.dep_manager.get_status(t1, {})
+        self.dep_manager.save_success(t1)
+        # broken link is part of the snapshot, state is stable
+        saved = self.dep_manager._get('t1', t1.dir_dep[0].db_key)
+        self.assertEqual(DirDep.BROKEN_LINK, saved['files']['broken.txt'])
+        self.assertEqual('up-to-date',
+                         self.dep_manager.get_status(t1, {}).status)
+
+        # removing the broken link is detected
+        os.remove(broken)
+        result = self.dep_manager.get_status(t1, {}, get_log=True)
+        self.assertEqual('run', result.status)
+        self.assertEqual([broken], result.reasons['dir_dep_removed'])
+        self.dep_manager.save_success(t1)
+
+        # re-creating it as a real file is a change
+        self._write('broken.txt', 'now a real file')
+        result = self.dep_manager.get_status(t1, {}, get_log=True)
+        self.assertEqual('run', result.status)
+        self.assertEqual([broken], result.reasons['dir_dep_added'])
+
+    def test_dir_symlink_policy(self):
+        outside = os.path.join(self._dir_tmp, 'outside')
+        os.makedirs(outside)
+        with open(os.path.join(outside, 'ext.txt'), 'w') as file_out:
+            file_out.write('external')
+        os.symlink(outside, os.path.join(self.root, 'link'))
+
+        # default: directory symlinks are not followed
+        t1 = self._make_task()
+        self.dep_manager.get_status(t1, {})
+        self.dep_manager.save_success(t1)
+        saved = self.dep_manager._get('t1', t1.dir_dep[0].db_key)
+        self.assertEqual({}, saved['files'])
+        self.assertEqual('up-to-date',
+                         self.dep_manager.get_status(t1, {}).status)
+
+        # follow_links=True: files behind the symlink are members
+        t2 = self._make_task(name='t2', follow_links=True)
+        result = self.dep_manager.get_status(t2, {}, get_log=True)
+        self.assertEqual('run', result.status)
+        self.assertEqual([self.root], result.reasons['dir_dep_no_previous'])
+        self.dep_manager.save_success(t2)
+        saved = self.dep_manager._get('t2', t2.dir_dep[0].db_key)
+        self.assertEqual({'link/ext.txt'}, set(saved['files']))
+
+    def test_cyclic_symlink_terminates(self):
+        self._write('a.txt')
+        os.makedirs(os.path.join(self.root, 'sub'))
+        # cycle: root/sub/loop -> root
+        os.symlink(self.root, os.path.join(self.root, 'sub', 'loop'))
+        t1 = self._make_task(follow_links=True)
+        result = self.dep_manager.get_status(t1, {})
+        self.assertEqual('run', result.status)
+        self.dep_manager.save_success(t1)
+        # each real directory was scanned only once
+        saved = self.dep_manager._get('t1', t1.dir_dep[0].db_key)
+        self.assertEqual({'a.txt'}, set(saved['files']))
+        self.assertEqual('up-to-date',
+                         self.dep_manager.get_status(t1, {}).status)
+
+    # -- stability of the snapshot
+
+    def test_change_during_run_is_not_saved(self):
+        self._write('a.txt')
+        t1 = self._make_task()
+        self.dep_manager.get_status(t1, {})
+        self.dep_manager.save_success(t1)
+        self.assertEqual('up-to-date',
+                         self.dep_manager.get_status(t1, {}).status)
+
+        # directory changes after the check but before save_success,
+        # i.e. while the task was running
+        self.dep_manager.get_status(t1, {})
+        added = self._write('b.txt')
+        self.dep_manager.save_success(t1)
+
+        # the mixed result must not become a successful snapshot:
+        # the change is still detected on the next check
+        result = self.dep_manager.get_status(t1, {}, get_log=True)
+        self.assertEqual('run', result.status)
+        self.assertEqual([added], result.reasons['dir_dep_added'])
+        # once stable, the snapshot is saved again
+        self.dep_manager.save_success(t1)
+        self.assertEqual('up-to-date',
+                         self.dep_manager.get_status(t1, {}).status)
+
+    def test_repeated_check_does_not_touch_saved_state(self):
+        self._write('a.txt')
+        t1 = self._make_task()
+        self.dep_manager.get_status(t1, {})
+        self.dep_manager.save_success(t1)
+        # failed task (no save_success) followed by checks:
+        # the last successful snapshot is preserved
+        added = self._write('b.txt')
+        for _ in range(3):
+            result = self.dep_manager.get_status(t1, {}, get_log=True)
+            self.assertEqual('run', result.status)
+            self.assertEqual([added], result.reasons['dir_dep_added'])
+        saved = self.dep_manager._get('t1', t1.dir_dep[0].db_key)
+        self.assertEqual({'a.txt'}, set(saved['files']))
+
+    # -- integration with actions and file_dep
+
+    def test_action_execution_count(self):
+        executed = []
+
+        def count_action():
+            executed.append(1)
+
+        self._write('a.txt')
+        t1 = self._make_task(actions=[count_action])
+
+        self.assertEqual('run', self._run_if_needed(t1).status)  # 1
+        self.assertEqual('up-to-date', self._run_if_needed(t1).status)
+        self._write('b.txt')
+        self.assertEqual('run', self._run_if_needed(t1).status)  # 2
+        self._remove('b.txt')
+        self.assertEqual('run', self._run_if_needed(t1).status)  # 3
+        self._write('a.txt', 'replaced content')
+        self.assertEqual('run', self._run_if_needed(t1).status)  # 4
+        self.assertEqual('up-to-date', self._run_if_needed(t1).status)
+        self.assertEqual(4, len(executed))
+
+    def test_combined_with_file_dep(self):
+        file_path = get_abspath("data/dependency1")
+        with open(file_path, "w") as file_out:
+            file_out.write("part1")
+        self._write('a.txt')
+        spec = DirDep(self.root)
+        t1 = Task("t1", None, file_dep=[file_path], dir_dep=[spec])
+
+        self.assertEqual('run', self.dep_manager.get_status(t1, {}).status)
+        self.dep_manager.save_success(t1)
+        self.assertEqual('up-to-date',
+                         self.dep_manager.get_status(t1, {}).status)
+
+        # dir_dep change triggers run
+        self._write('b.txt')
+        result = self.dep_manager.get_status(t1, {}, get_log=True)
+        self.assertEqual('run', result.status)
+        self.assertEqual([os.path.join(self.root, 'b.txt')],
+                         result.reasons['dir_dep_added'])
+        self.dep_manager.save_success(t1)
+
+        # file_dep change still triggers run
+        time.sleep(1)
+        with open(file_path, "a") as file_out:
+            file_out.write(" part2")
+        result = self.dep_manager.get_status(t1, {}, get_log=True)
+        self.assertEqual('run', result.status)
+        self.assertEqual([file_path], result.reasons['changed_file_dep'])
+
+
+class TestDirDepJson(DependencyTestBase, _DirDepTests, unittest.TestCase):
+    backend_name = 'json'
+
+class TestDirDepSqlite(DependencyTestBase, _DirDepTests, unittest.TestCase):
+    backend_name = 'sqlite3'
+
+class TestDirDepDbmGnu(DependencyTestBase, _DirDepTests, unittest.TestCase):
+    backend_name = 'dbm.gnu'
+
+class TestDirDepDbmNdbm(DependencyTestBase, _DirDepTests, unittest.TestCase):
+    backend_name = 'dbm.ndbm'
+
+class TestDirDepDbmDumb(DependencyTestBase, _DirDepTests, unittest.TestCase):
     backend_name = 'dbm.dumb'

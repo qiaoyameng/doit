@@ -11,7 +11,7 @@ from pathlib import PurePath
 from .cmdparse import CmdOption, TaskParse
 from .exceptions import BaseFail, InvalidTask
 from .action import create_action, PythonAction
-from .dependency import UptodateCalculator
+from .dependency import UptodateCalculator, DirDep
 
 
 def first_line(doc):
@@ -116,6 +116,7 @@ class Task:
     @ivar task_dep: (list - string)
     @ivar wild_dep: (list - string) task dependency using wildcard *
     @ivar file_dep: (set - string)
+    @ivar dir_dep: (list - DirDep) directory dependencies
     @ivar calc_dep: (set - string) reference to a task
     @ivar dep_changed (list - string): list of file-dependencies that changed
           (are not up_to_date). this must be set before
@@ -149,6 +150,7 @@ class Task:
                   'name': (string_types, ()),
                   'actions': ((list, tuple), (None,)),
                   'file_dep': ((list, tuple), ()),
+                  'dir_dep': ((list, tuple), ()),
                   'task_dep': ((list, tuple), ()),
                   'uptodate': ((list, tuple), ()),
                   'calc_dep': ((list, tuple), ()),
@@ -174,7 +176,7 @@ class Task:
                  subtask_of=None, has_subtask=False,
                  doc=None, params=(), pos_arg=None,
                  verbosity=None, io=None, title=None, getargs=None,
-                 watch=(), meta=None, loader=None):
+                 watch=(), meta=None, loader=None, dir_dep=()):
         """sanity checks and initialization
 
         @param params: (list of dict for parameters) see cmdparse.CmdOption
@@ -184,6 +186,7 @@ class Task:
         self.check_attr(name, 'name', name, self.valid_attr['name'])
         self.check_attr(name, 'actions', actions, self.valid_attr['actions'])
         self.check_attr(name, 'file_dep', file_dep, self.valid_attr['file_dep'])
+        self.check_attr(name, 'dir_dep', dir_dep, self.valid_attr['dir_dep'])
         self.check_attr(name, 'task_dep', task_dep, self.valid_attr['task_dep'])
         self.check_attr(name, 'uptodate', uptodate, self.valid_attr['uptodate'])
         self.check_attr(name, 'calc_dep', calc_dep, self.valid_attr['calc_dep'])
@@ -220,7 +223,7 @@ class Task:
         else:
             self._actions = list(actions[:])
 
-        self._init_deps(file_dep, task_dep, calc_dep)
+        self._init_deps(file_dep, task_dep, calc_dep, dir_dep)
 
         # loaders create an implicity task_dep
         self.loader = loader
@@ -261,13 +264,17 @@ class Task:
         self.executed = False
 
 
-    def _init_deps(self, file_dep, task_dep, calc_dep):
+    def _init_deps(self, file_dep, task_dep, calc_dep, dir_dep=()):
         """init for dependency related attributes"""
         self.dep_changed = None
 
         # file_dep
         self.file_dep = set()
         self._expand_file_dep(file_dep)
+
+        # dir_dep
+        self.dir_dep = []
+        self._expand_dir_dep(dir_dep)
 
         # task_dep
         self.task_dep = []
@@ -332,6 +339,16 @@ class Task:
                 self.file_dep.add(str(dep))
             else:
                 msg = ("%s. file_dep must be a str or Path from pathlib. "
+                       "Got '%r' (%s)")
+                raise InvalidTask(msg % (self.name, dep, type(dep)))
+
+    def _expand_dir_dep(self, dir_dep):
+        """validate and put input into dir_dep"""
+        for dep in dir_dep:
+            if isinstance(dep, DirDep):
+                self.dir_dep.append(dep)
+            else:
+                msg = ("%s. dir_dep must be a DirDep instance. "
                        "Got '%r' (%s)")
                 raise InvalidTask(msg % (self.name, dep, type(dep)))
 

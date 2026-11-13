@@ -364,6 +364,59 @@ Traditional build-tools can only handle files as "dependencies".
    than it actually used to execute the task.
 
 
+.. _dir-dep:
+
+dir_dep (directory dependency)
+------------------------------
+
+`file_dep` only tracks the files explicitly listed when the task is
+created, so files added to a directory later go unnoticed. A ``dir_dep``
+tracks the *content of a whole directory*: the directory is scanned and
+a snapshot of the selected members is saved after every successful
+execution. The task is not up-to-date if any selected member was added,
+removed or modified since the last successful execution.
+
+``dir_dep`` is a list of :class:`doit.dependency.DirDep` instances:
+
+.. code-block:: python
+
+   from doit.dependency import DirDep
+
+   def task_build():
+       return {
+           'actions': ['build_site src/ site/'],
+           'dir_dep': [DirDep('src', patterns=('*.txt', '*.md'),
+                              recursive=True, follow_links=False)],
+           'targets': ['site/index.html'],
+       }
+
+* ``root``: path of the directory to scan.
+* ``patterns``: ``fnmatch`` patterns matched against each member's
+  relative path (``*`` also matches path separators, so ``*.txt``
+  selects files in sub-directories too). Members that do not match
+  never affect the task status. Defaults to ``('*',)`` — everything.
+* ``recursive``: scan sub-directories (default `True`).
+* ``follow_links``: follow symbolic links to directories
+  (default `False`). Links to files are always resolved to their
+  target's state.
+
+Scan results are recorded with normalized relative paths. Some defined
+behaviors:
+
+* an empty directory (no selected member) is a valid snapshot;
+* broken symbolic links are recorded as members, so their appearance,
+  removal or repair is detected;
+* cyclic links (only possible with ``follow_links=True``) are scanned
+  only once, never causing an infinite loop;
+* a missing ``root`` directory is scanned as an empty directory.
+
+If the directory changes *while the task is running* (between the
+up-to-date check and the end of the execution), the mixed scan is
+considered unstable and is **not** saved as a successful snapshot —
+the previous successful snapshot is kept, so the change is still
+detected on the next run.
+
+
 targets
 -------
 

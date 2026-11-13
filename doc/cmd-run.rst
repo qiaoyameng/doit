@@ -120,6 +120,17 @@ different backends:
  - `sqlite3`: Support concurrent access
    (DB is updated only once when process is terminated for better performance).
 
+ - `sqlite3-shared`: SQLite backend designed for several `doit` processes
+   sharing one DB file. Every task record is stored with an integer
+   `version`; a task's dependency signatures, values and result are saved
+   together as one atomic versioned row. Processes working on different
+   tasks commit concurrently without overwriting each other, while two
+   processes saving the *same* task get an explicit version conflict.
+   `forget`, task removal and a full DB wipe are version checked too, so a
+   late commit from an old process can never resurrect a deleted record.
+   Writes are flushed in short transactions at the end of the run, so no
+   database write lock is held while a task action is executing.
+
 
 From the command line you can select the backend using the ``--backend`` option.
 

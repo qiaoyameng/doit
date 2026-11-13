@@ -8,7 +8,8 @@ from .globals import Globals
 from . import version
 from .cmdparse import CmdOption, CmdParse
 from .exceptions import InvalidCommand, InvalidDodoFile
-from .dependency import CHECKERS, DbmDB, JsonDB, SqliteDB, Dependency, JSONCodec
+from .dependency import CHECKERS, DbmDB, JsonDB, SqliteDB, SharedSqliteDB
+from .dependency import Dependency, JSONCodec
 from .action import CmdAction
 from .plugin import PluginDict
 from . import loader
@@ -501,7 +502,8 @@ class DoitCmdBase(Command):
 
     def get_backends(self):
         """return PluginDict of DB backends, including core and plugins"""
-        backend_map = {'dbm': DbmDB, 'json': JsonDB, 'sqlite3': SqliteDB}
+        backend_map = {'dbm': DbmDB, 'json': JsonDB, 'sqlite3': SqliteDB,
+                       'sqlite3-shared': SharedSqliteDB}
         # add plugins
         plugins = PluginDict()
         plugins.add_plugins(self.config, 'BACKEND')

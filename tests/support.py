@@ -11,7 +11,7 @@ import itertools
 from dbm import whichdb
 
 from doit.dependency import Dependency, MD5Checker
-from doit.dependency import DbmDB, JsonDB, SqliteDB
+from doit.dependency import DbmDB, JsonDB, SqliteDB, SharedSqliteDB
 from doit.task import Task
 from doit.cmd_base import get_loader
 
@@ -50,6 +50,7 @@ backend_map = {
     'dbm.dumb': DbmDB,
     'json': JsonDB,
     'sqlite3': SqliteDB,
+    'sqlite3-shared': SharedSqliteDB,
 }
 
 

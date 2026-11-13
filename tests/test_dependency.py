@@ -2,17 +2,20 @@
 import os
 import sys
 import time
+import json
 import tempfile
 import shutil
+import sqlite3
 from dbm import whichdb
 from sys import executable
+import multiprocessing
 from unittest.mock import patch
 import unittest
 
 from doit.task import Task
 from doit.dependency import get_md5, get_file_md5
-from doit.dependency import DbmDB, Dependency
-from doit.dependency import DatabaseException, UptodateCalculator
+from doit.dependency import DbmDB, Dependency, SharedSqliteDB, SqliteDB
+from doit.dependency import DatabaseException, TaskVersionConflict, UptodateCalculator
 from doit.dependency import FileChangedChecker, MD5Checker, TimestampChecker
 from doit.dependency import DependencyStatus
 from tests.support import get_abspath, backend_map, db_ext
@@ -224,6 +227,10 @@ class TestDependencyDbJson(DependencyTestBase, _DependencyDbTests, unittest.Test
 class TestDependencyDbSqlite(DependencyTestBase, _DependencyDbTests, unittest.TestCase):
     backend_name = 'sqlite3'
 
+class TestDependencyDbSqliteShared(DependencyTestBase, _DependencyDbTests,
+                                   unittest.TestCase):
+    backend_name = 'sqlite3-shared'
+
 class TestDependencyDbDbmGnu(DependencyTestBase, _DependencyDbTests, unittest.TestCase):
     backend_name = 'dbm.gnu'
 
@@ -327,6 +334,10 @@ class TestSaveSuccessJson(DependencyTestBase, _SaveSuccessTests, unittest.TestCa
 class TestSaveSuccessSqlite(DependencyTestBase, _SaveSuccessTests, unittest.TestCase):
     backend_name = 'sqlite3'
 
+class TestSaveSuccessSqliteShared(DependencyTestBase, _SaveSuccessTests,
+                                  unittest.TestCase):
+    backend_name = 'sqlite3-shared'
+
 class TestSaveSuccessDbmGnu(DependencyTestBase, _SaveSuccessTests, unittest.TestCase):
     backend_name = 'dbm.gnu'
 
@@ -381,6 +392,9 @@ class TestGetValueJson(DependencyTestBase, _GetValueTests, unittest.TestCase):
 class TestGetValueSqlite(DependencyTestBase, _GetValueTests, unittest.TestCase):
     backend_name = 'sqlite3'
 
+class TestGetValueSqliteShared(DependencyTestBase, _GetValueTests, unittest.TestCase):
+    backend_name = 'sqlite3-shared'
+
 class TestGetValueDbmGnu(DependencyTestBase, _GetValueTests, unittest.TestCase):
     backend_name = 'dbm.gnu'
 
@@ -412,6 +426,10 @@ class TestRemoveSuccessJson(DependencyTestBase, _RemoveSuccessTests, unittest.Te
 class TestRemoveSuccessSqlite(DependencyTestBase, _RemoveSuccessTests, unittest.TestCase):
     backend_name = 'sqlite3'
 
+class TestRemoveSuccessSqliteShared(DependencyTestBase, _RemoveSuccessTests,
+                                    unittest.TestCase):
+    backend_name = 'sqlite3-shared'
+
 class TestRemoveSuccessDbmGnu(DependencyTestBase, _RemoveSuccessTests, unittest.TestCase):
     backend_name = 'dbm.gnu'
 
@@ -439,6 +457,9 @@ class TestIgnoreJson(DependencyTestBase, _IgnoreTests, unittest.TestCase):
 
 class TestIgnoreSqlite(DependencyTestBase, _IgnoreTests, unittest.TestCase):
     backend_name = 'sqlite3'
+
+class TestIgnoreSqliteShared(DependencyTestBase, _IgnoreTests, unittest.TestCase):
+    backend_name = 'sqlite3-shared'
 
 class TestIgnoreDbmGnu(DependencyTestBase, _IgnoreTests, unittest.TestCase):
     backend_name = 'dbm.gnu'
@@ -904,6 +925,9 @@ class TestGetStatusJson(DependencyTestBase, _GetStatusTests, unittest.TestCase):
 class TestGetStatusSqlite(DependencyTestBase, _GetStatusTests, unittest.TestCase):
     backend_name = 'sqlite3'
 
+class TestGetStatusSqliteShared(DependencyTestBase, _GetStatusTests, unittest.TestCase):
+    backend_name = 'sqlite3-shared'
+
 class TestGetStatusDbmGnu(DependencyTestBase, _GetStatusTests, unittest.TestCase):
     backend_name = 'dbm.gnu'
 
@@ -912,3 +936,289 @@ class TestGetStatusDbmNdbm(DependencyTestBase, _GetStatusTests, unittest.TestCas
 
 class TestGetStatusDbmDumb(DependencyTestBase, _GetStatusTests, unittest.TestCase):
     backend_name = 'dbm.dumb'
+
+
+# ---------------------------------------------------------------------------
+# SharedSqliteDB: versioned, multi-process safe sqlite3 backend
+
+def _make_task(name, result=None, values=None):
+    task = Task(name, None)
+    if result is not None:
+        task.result = result
+    if values is not None:
+        task.values = values
+    return task
+
+
+def _worker_different_tasks(db_path, task_name, result, barrier, queue):
+    """Two processes snapshot the DB then commit disjoint task rows."""
+    try:
+        dep = Dependency(SharedSqliteDB, db_path)
+        # force a read so both processes hold a snapshot before any flush
+        dep._get(task_name, 'result:')
+        barrier.wait()
+        dep.save_success(_make_task(task_name, result))
+        dep.close()
+        queue.put(('ok', task_name, result))
+    except Exception as exception:  # pragma: no cover - failure reporting
+        queue.put(('error', repr(exception)))
+
+
+def _worker_same_task(db_path, task_name, result, barrier, queue):
+    """Both processes snapshot then save the same task: one must conflict."""
+    try:
+        dep = Dependency(SharedSqliteDB, db_path)
+        dep._get(task_name, 'result:')
+        barrier.wait()
+        dep.save_success(_make_task(task_name, result))
+        dep.close()
+        queue.put(('ok', result))
+    except TaskVersionConflict:
+        queue.put(('conflict', result))
+    except Exception as exception:  # pragma: no cover - failure reporting
+        queue.put(('error', repr(exception)))
+
+
+def _worker_delete_then_commit(db_path, task_name, first_barrier,
+                               second_barrier, queue, do_delete):
+    """Deterministic delete-before-late-commit ordering using two barriers."""
+    try:
+        dep = Dependency(SharedSqliteDB, db_path)
+        dep._get(task_name, 'result:')
+        first_barrier.wait()
+        if do_delete:
+            dep.remove(task_name)
+            dep.close()
+            queue.put(('deleted',))
+            second_barrier.wait()
+        else:
+            second_barrier.wait()
+            dep.save_success(_make_task(task_name, 'late-commit'))
+            try:
+                dep.close()
+                queue.put(('resurrected',))
+            except TaskVersionConflict:
+                queue.put(('conflict',))
+    except Exception as exception:  # pragma: no cover - failure reporting
+        queue.put(('error', repr(exception)))
+
+
+class TestSharedSqliteDB(unittest.TestCase):
+    """Versioned sqlite3 backend semantics, single and multi process."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.mkdtemp(prefix='doit-test-shared-')
+        self.db_path = os.path.join(self._tmpdir, 'shared.db')
+
+    def tearDown(self):
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def _open(self):
+        return Dependency(SharedSqliteDB, self.db_path)
+
+    def _raw(self):
+        conn = sqlite3.connect(self.db_path)
+        self.addCleanup(conn.close)
+        return conn
+
+    # ----- single process: versions and atomic task rows
+
+    def test_save_bumps_version_and_keeps_full_row(self):
+        dep = self._open()
+        task = _make_task('t1', 'r1', values={'k': 'v'})
+        dep.save_success(task)
+        dep.close()
+        row = self._raw().execute(
+            'select task_data, version, generation from doit '
+            "where task_id='t1'").fetchone()
+        self.assertEqual(1, row[1])
+        self.assertEqual(1, row[2])
+        # signatures, values and result live in one atomic row
+        data = json.loads(row[0])
+        self.assertEqual({'k': 'v'}, data['_values_:'])
+        self.assertEqual(get_md5('r1'), data['result:'])
+        self.assertIn('deps:', data)
+
+        dep = self._open()
+        dep.save_success(_make_task('t1', 'r2'))
+        dep.close()
+        version = self._raw().execute(
+            "select version from doit where task_id='t1'").fetchone()[0]
+        self.assertEqual(2, version)
+
+    def test_stale_remove_raises_conflict(self):
+        dep = self._open()
+        dep.save_success(_make_task('t1', 'r1'))
+        dep.close()
+
+        first = self._open()
+        stale = self._open()
+        # both snapshot the current version
+        first._get('t1', 'result:')
+        stale._get('t1', 'result:')
+        first.remove('t1')
+        first.close()
+        with self.assertRaises(TaskVersionConflict):
+            stale.remove('t1')
+            stale.close()
+        # the current-version delete won; the stale process leaves no row
+        self.assertFalse(self._open()._in('t1'))
+
+    def test_remove_all_generation_blocks_late_writer(self):
+        dep = self._open()
+        dep.save_success(_make_task('t1', 'r1'))
+        dep.close()
+
+        late = self._open()
+        late._get('t1', 'result:')  # snapshot generation 1
+        late.save_success(_make_task('brand_new', 'x'))  # buffered, no lock
+
+        wiper = self._open()
+        wiper.remove_all()
+        wiper.close()
+
+        with self.assertRaises(TaskVersionConflict):
+            late.close()
+        raw = self._raw()
+        self.assertEqual(0, raw.execute('select count(*) from doit').fetchone()[0])
+        self.assertEqual(2, raw.execute(
+            "select value from doit_meta where key='generation'").fetchone()[0])
+
+        # a process opening after the wipe can write again on the new gen
+        fresh = self._open()
+        fresh.save_success(_make_task('after', 'ok'))
+        fresh.close()
+        self.assertEqual(
+            2, self._raw().execute(
+                "select generation from doit where task_id='after'").fetchone()[0])
+
+    def test_migrates_legacy_sqlite_database(self):
+        legacy = Dependency(SqliteDB, self.db_path)
+        legacy.save_success(_make_task('old', 'legacy-result'))
+        legacy.close()
+
+        shared = self._open()  # must not raise on the old schema
+        self.assertEqual(
+            get_md5('legacy-result'), shared._get('old', 'result:'))
+        shared.save_success(_make_task('old', 'new-result'))
+        shared.close()
+        version, generation = self._raw().execute(
+            "select version, generation from doit where task_id='old'").fetchone()
+        self.assertEqual(2, version)
+        self.assertEqual(1, generation)
+
+    def test_close_failure_keeps_original_error(self):
+        dep = self._open()
+        dep._set('t1', 'k', 'v')
+        original = RuntimeError('original close error')
+
+        class FailingConn:
+            def __init__(self, real):
+                self._real = real
+            def execute(self, *args, **kwargs):
+                return self._real.execute(*args, **kwargs)
+            def commit(self):
+                self._real.commit()
+            def rollback(self):
+                self._real.rollback()
+            def close(self):
+                raise original
+
+        dep.backend._conn = FailingConn(dep.backend._conn)
+        with self.assertRaises(RuntimeError) as caught:
+            dep.close()
+        self.assertIs(original, caught.exception)
+
+    # ----- multi process, synchronized with barriers (no sleep)
+
+    def test_two_processes_commit_distinct_tasks(self):
+        ctx = multiprocessing.get_context('fork')
+        queue = ctx.Queue()
+        barrier = ctx.Barrier(2)
+        specs = [('alpha', 'res-alpha'), ('beta', 'res-beta')]
+        procs = [
+            ctx.Process(target=_worker_different_tasks,
+                        args=(self.db_path, name, result, barrier, queue))
+            for name, result in specs]
+        for proc in procs:
+            proc.start()
+        for proc in procs:
+            proc.join(30)
+            self.assertFalse(proc.is_alive(), 'worker process hung')
+            self.assertEqual(0, proc.exitcode)
+        statuses = [queue.get() for _ in procs]
+        self.assertEqual({'ok'}, {status[0] for status in statuses})
+
+        # reopen the DB in a third process and check rows and versions
+        check = self._open()
+        self.assertEqual(get_md5('res-alpha'),
+                         check._get('alpha', 'result:'))
+        self.assertEqual(get_md5('res-beta'),
+                         check._get('beta', 'result:'))
+        check.close()
+        rows = self._raw().execute(
+            'select task_id, version from doit order by task_id').fetchall()
+        self.assertEqual([('alpha', 1), ('beta', 1)], rows)
+
+    def test_two_processes_same_task_one_conflict(self):
+        ctx = multiprocessing.get_context('fork')
+        queue = ctx.Queue()
+        barrier = ctx.Barrier(2)
+        procs = [
+            ctx.Process(target=_worker_same_task,
+                        args=(self.db_path, 'shared-task',
+                              'res-%d' % index, barrier, queue))
+            for index in range(2)]
+        for proc in procs:
+            proc.start()
+        for proc in procs:
+            proc.join(30)
+            self.assertFalse(proc.is_alive(), 'worker process hung')
+            self.assertEqual(0, proc.exitcode)
+        statuses = sorted(queue.get()[0] for _ in procs)
+        self.assertEqual(['conflict', 'ok'], statuses)
+
+        rows = self._raw().execute(
+            "select task_id, version from doit where task_id='shared-task'"
+        ).fetchall()
+        self.assertEqual(1, len(rows))
+        self.assertEqual(1, rows[0][1])
+
+    def test_delete_blocks_late_commit_no_resurrection(self):
+        ctx = multiprocessing.get_context('fork')
+        queue = ctx.Queue()
+        first_barrier = ctx.Barrier(2)
+        second_barrier = ctx.Barrier(2)
+
+        seed = self._open()
+        seed.save_success(_make_task('doomed', 'seed'))
+        seed.close()
+
+        deleter = ctx.Process(
+            target=_worker_delete_then_commit,
+            args=(self.db_path, 'doomed', first_barrier, second_barrier,
+                  queue, True))
+        late = ctx.Process(
+            target=_worker_delete_then_commit,
+            args=(self.db_path, 'doomed', first_barrier, second_barrier,
+                  queue, False))
+        deleter.start()
+        late.start()
+        deleter.join(30)
+        late.join(30)
+        self.assertFalse(deleter.is_alive() or late.is_alive(),
+                         'worker process hung')
+        self.assertEqual(0, deleter.exitcode)
+        self.assertEqual(0, late.exitcode)
+
+        outcomes = sorted(queue.get()[0] for _ in range(2))
+        self.assertEqual(['conflict', 'deleted'], outcomes)
+        raw = self._raw()
+        self.assertEqual(
+            0, raw.execute("select count(*) from doit where task_id='doomed'"
+                           ).fetchone()[0])
+
+        # the record stays gone after reopening the database
+        reopened = self._open()
+        self.assertFalse(reopened._in('doomed'))
+        reopened.close()

@@ -18,6 +18,16 @@ class DatabaseException(Exception):
     pass
 
 
+class TaskVersionConflict(Exception):
+    """Raised by versioned backends on an optimistic-locking conflict.
+
+    A process tried to write or remove a task record using a version that
+    is no longer current (another process already committed a newer
+    version, or the record was deleted / invalidated in the meantime).
+    """
+    pass
+
+
 def get_md5(input_data):
     """return md5 from string or unicode"""
     byte_data = input_data.encode("utf-8")
@@ -344,6 +354,244 @@ class SqliteDB:
         self._conn.execute('delete from doit')
         self._cache = {}
         self._dirty = set()
+
+
+class SharedSqliteDB:
+    """SQLite backend for several processes sharing one dependency file.
+
+    Unlike :class:`SqliteDB`, which caches the whole DB in one process and
+    overwrites rows blindly on close, every task row carries an integer
+    ``version``. A task's dependency signatures, ``_values_:`` and
+    ``result:`` are written together as a single versioned row in one
+    short transaction, so concurrent processes committing *different*
+    tasks do not overwrite each other, while concurrent commits of the
+    *same* task get an explicit :class:`TaskVersionConflict`.
+
+    Writes and deletes are validated against the version the process
+    observed and are only flushed on :meth:`dump`, inside short
+    ``BEGIN IMMEDIATE`` transactions. No write lock is ever held while a
+    task action is running. A table-wide :meth:`remove_all` bumps a
+    stored generation number, so late commits from processes that loaded
+    the DB before the wipe can not resurrect the deleted records.
+
+    The legacy single-process :class:`SqliteDB` behavior is unchanged.
+    """
+
+    desc = 'sqlite3 database with multi-process versioned writes'
+
+    def __init__(self, name, codec, *, module_name=None):
+        self.name = name
+        self.codec = codec
+        self._conn = self._sqlite3(self.name)
+        self._cache = {}
+        # version (int) of each task as observed/last written by this process
+        self._versions = {}
+        self._dirty = set()
+        self._removed = set()
+        self._generation = self._load_generation()
+
+    def _sqlite3(self, name):
+        """Open/create a sqlite3 DB file, creating or migrating the schema."""
+        # Import sqlite here so it's only imported when required
+        import sqlite3
+
+        def dict_factory(cursor, row):
+            """convert row to dict"""
+            data = {}
+            for idx, col in enumerate(cursor.description):
+                data[col[0]] = row[idx]
+            return data
+
+        def converter(data):
+            return self.codec.decode(data.decode('utf-8'))
+
+        sqlite3.register_adapter(list, self.codec.encode)
+        sqlite3.register_adapter(dict, self.codec.encode)
+        sqlite3.register_converter("json", converter)
+        conn = sqlite3.connect(
+            name,
+            detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES,
+            isolation_level='DEFERRED',
+            timeout=10)
+        conn.row_factory = dict_factory
+        # do not fail immediately if another process is briefly writing
+        conn.execute('pragma busy_timeout=10000')
+        try:
+            conn.execute("""
+                create table if not exists doit (
+                    task_id text not null primary key,
+                    task_data json,
+                    version integer not null default 1,
+                    generation integer not null default 1
+                );""")
+            # migrate a DB created by the legacy single-process SqliteDB
+            columns = {row['name']
+                       for row in conn.execute('pragma table_info(doit)')}
+            if 'version' not in columns:
+                conn.execute('alter table doit add column version '
+                             'integer not null default 1')
+            if 'generation' not in columns:
+                conn.execute('alter table doit add column generation '
+                             'integer not null default 1')
+            conn.execute("""
+                create table if not exists doit_meta (
+                    key text not null primary key,
+                    value integer not null
+                );""")
+            conn.execute('insert or ignore into doit_meta values (?, ?)',
+                         ('generation', 1))
+            conn.commit()
+        except sqlite3.DatabaseError as exception:
+            new_message = (
+                'Dependencies file in %(filename)s seems to use '
+                'an bad format or is corrupted.\n'
+                'To fix the issue you can just remove the database file(s) '
+                'and a new one will be generated.'
+                'Original error: %(msg)s'
+                % {'filename': repr(name), 'msg': str(exception)})
+            raise DatabaseException(new_message)
+        return conn
+
+    def _load_generation(self):
+        row = self._conn.execute(
+            'select value from doit_meta where key=?',
+            ('generation',)).fetchone()
+        return row['value'] if row else 1
+
+    def _load_task(self, task_id):
+        """load one task row, honoring the current generation."""
+        row = self._conn.execute(
+            'select task_data, version, generation from doit '
+            'where task_id=?', (task_id,)).fetchone()
+        if row is None or row['generation'] != self._generation:
+            data, version = {}, None
+        else:
+            data, version = row['task_data'], row['version']
+        self._cache[task_id] = data
+        self._versions[task_id] = version
+        return data, version
+
+    def get(self, task_id, dependency):
+        """Get value stored in the DB.
+
+        :return: string or None if entry not found
+        """
+        if task_id in self._cache:
+            data = self._cache[task_id]
+        else:
+            data, _ = self._load_task(task_id)
+        return data.get(dependency, None)
+
+    def in_(self, task_id):
+        if task_id not in self._cache:
+            self._load_task(task_id)
+        if task_id in self._removed:
+            return False
+        if task_id in self._dirty or self._versions[task_id] is not None:
+            return bool(self._cache[task_id])
+        return False
+
+    def set(self, task_id, dependency, value):
+        """Buffer value in the DB; the whole task row is written atomically."""
+        if task_id not in self._cache:
+            self._load_task(task_id)
+        self._cache[task_id][dependency] = value
+        self._dirty.add(task_id)
+        self._removed.discard(task_id)
+
+    def remove(self, task_id):
+        """Buffer a version-checked removal of taskId's saved data."""
+        if task_id not in self._cache:
+            self._load_task(task_id)
+        self._cache[task_id] = {}
+        if self._versions[task_id] is not None:
+            self._removed.add(task_id)
+        self._dirty.discard(task_id)
+
+    def remove_all(self):
+        """Remove every task row and bump the generation in one transaction."""
+        import sqlite3
+        try:
+            self._conn.execute('begin immediate')
+            self._conn.execute('delete from doit')
+            self._conn.execute(
+                'update doit_meta set value=value+1 where key=?',
+                ('generation',))
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+        self._generation += 1
+        self._cache = {}
+        self._versions = {}
+        self._dirty = set()
+        self._removed = set()
+
+    def dump(self):
+        """flush all buffered writes/removals then close the DB file"""
+        self._flush()
+        self._conn.close()
+
+    def _flush(self):
+        """apply buffered changes inside short version-checked transactions."""
+        if not (self._dirty or self._removed):
+            return
+        import sqlite3
+        conn = self._conn
+        try:
+            conn.execute('begin immediate')
+
+            for task_id in self._removed:
+                cursor = conn.execute(
+                    'delete from doit where task_id=? and version=? '
+                    'and generation=?',
+                    (task_id, self._versions[task_id], self._generation))
+                if cursor.rowcount == 0:
+                    raise TaskVersionConflict(
+                        "conflict removing task '%s': version %s is no "
+                        "longer current"
+                        % (task_id, self._versions[task_id]))
+                self._versions[task_id] = None
+
+            for task_id in self._dirty:
+                expected = self._versions[task_id]
+                encoded = self.codec.encode(self._cache[task_id])
+                if expected is None:
+                    try:
+                        cursor = conn.execute(
+                            'insert into doit (task_id, task_data, version, '
+                            'generation) select ?, ?, 1, ? where ? = ('
+                            'select value from doit_meta where key=?)',
+                            (task_id, encoded, self._generation,
+                             self._generation, 'generation'))
+                    except sqlite3.IntegrityError:
+                        raise TaskVersionConflict(
+                            "conflict saving task '%s': the record already "
+                            "exists" % task_id)
+                    if cursor.rowcount == 0:
+                        raise TaskVersionConflict(
+                            "conflict saving task '%s': the database was "
+                            "invalidated by a remove_all after this process "
+                            "opened it" % task_id)
+                    new_version = 1
+                else:
+                    cursor = conn.execute(
+                        'update doit set task_data=?, version=version+1 '
+                        'where task_id=? and version=? and generation=?',
+                        (encoded, task_id, expected, self._generation))
+                    if cursor.rowcount == 0:
+                        raise TaskVersionConflict(
+                            "conflict saving task '%s': version %s is no "
+                            "longer current" % (task_id, expected))
+                    new_version = expected + 1
+                self._versions[task_id] = new_version
+
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        self._dirty = set()
+        self._removed = set()
 
 
 class FileChangedChecker:

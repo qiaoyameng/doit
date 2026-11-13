@@ -95,6 +95,16 @@ class TaskError(BaseFail):
     pass
 
 
+class TaskTimeout(TaskError):
+    """Task execution exceeded its time limit.
+
+    The task is treated as an error: its success record is removed so it
+    must be re-run on the next execution, while already captured
+    stdout/stderr is kept for inspection.
+    """
+    pass
+
+
 class UnmetDependency(TaskError):
     """Task was not executed because a dependent task failed or is ignored"""
     pass

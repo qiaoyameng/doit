@@ -10,7 +10,7 @@ from pathlib import PurePath
 
 from .cmdparse import CmdOption, TaskParse
 from .exceptions import BaseFail, InvalidTask
-from .action import create_action, PythonAction
+from .action import create_action, PythonAction, Deadline
 from .dependency import UptodateCalculator
 
 
@@ -160,6 +160,7 @@ class Task:
                   'params': ((list, tuple,), ()),
                   'pos_arg': (string_types, (None,)),
                   'verbosity': ((), (None, 0, 1, 2,)),
+                  'timeout': ((int, float), (None,)),
                   'io': ((dict,), (None,)),
                   'getargs': ((dict,), ()),
                   'title': ((Callable,), (None,)),
@@ -174,7 +175,7 @@ class Task:
                  subtask_of=None, has_subtask=False,
                  doc=None, params=(), pos_arg=None,
                  verbosity=None, io=None, title=None, getargs=None,
-                 watch=(), meta=None, loader=None):
+                 watch=(), meta=None, loader=None, timeout=None):
         """sanity checks and initialization
 
         @param params: (list of dict for parameters) see cmdparse.CmdOption
@@ -195,6 +196,7 @@ class Task:
         self.check_attr(name, 'params', params, self.valid_attr['params'])
         self.check_attr(name, 'pos_arg', pos_arg, self.valid_attr['pos_arg'])
         self.check_attr(name, 'verbosity', verbosity, self.valid_attr['verbosity'])
+        self.check_attr(name, 'timeout', timeout, self.valid_attr['timeout'])
         self.check_attr(name, 'io', io, self.valid_attr['io'])
         self.check_attr(name, 'getargs', getargs, self.valid_attr['getargs'])
         self.check_attr(name, 'title', title, self.valid_attr['title'])
@@ -205,6 +207,14 @@ class Task:
             msg = "Task '{}': name must not use the char '=' (equal sign)."
             raise InvalidTask(msg.format(name))
         self.name = name
+        # bool is a subclass of int but does not make sense here
+        if timeout is not None and (
+                isinstance(timeout, bool) or timeout <= 0):
+            msg = ("Task '%s' attribute 'timeout' must be a positive "
+                   "number of seconds (int or float) or None, got: %r"
+                   % (name, timeout))
+            raise InvalidTask(msg)
+        self.timeout = timeout
         self.params = params  # save just for use on command `info`
         self.creator_params = []  # add through task_params decorator
         self.options = None
@@ -469,8 +479,18 @@ class Task:
         self.executed = True
         self.init_options()
         task_stdout, task_stderr = stream._get_out_err(self.verbosity)
+        # The deadline is created here, at the moment the task actually
+        # starts executing, so time spent queuing for a runner slot is
+        # never counted. The same deadline bounds the whole action chain.
+        deadline = Deadline(self.timeout)
         for action in self.actions:
-            action_return = action.execute(task_stdout, task_stderr)
+            if self.timeout is None:
+                # keep the historical two-argument call working for
+                # custom BaseAction subclasses that override execute()
+                action_return = action.execute(task_stdout, task_stderr)
+            else:
+                action_return = action.execute(
+                    task_stdout, task_stderr, deadline=deadline)
             if isinstance(action_return, BaseFail):
                 return action_return
             self.result = action.result

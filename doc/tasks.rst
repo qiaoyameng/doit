@@ -643,6 +643,49 @@ You can control the verbosity by:
 * from command line, see :ref:`verbosity option<verbosity_option>`.
 
 
+.. _timeout:
+
+timeout
+-------
+
+A task can define an optional ``timeout`` attribute, the maximum number
+of seconds (``int`` or ``float``) the task is allowed to run once its
+execution actually starts. Time spent waiting in a runner queue for a
+free worker is **not** counted. The same deadline bounds the whole
+sequence of actions of the task.
+
+When the deadline is reached:
+
+* no further action of the task is started;
+* for a *cmd-action*, the spawned process and all of its child
+  processes are terminated; the stdout/stderr already captured and the
+  timeout reason are preserved on the task;
+* the task finishes in an error state. Its success record, ``values``
+  and action ``result`` are not saved, so the task must be re-run on the
+  next execution;
+* tasks that depend on it are not executed, while unrelated tasks can
+  still complete (use ``--continue`` to keep going after the error).
+
+A *python-action* can only be interrupted safely through ``SIGALRM`` on
+the main thread. This works with the serial and multi-process runners.
+The threaded runner (``MThreadRunner``) cannot interrupt arbitrary
+python callables, so combining it with a ``timeout`` on a python-action
+is refused before execution with an ``InvalidTask`` error; use a
+cmd-action, another runner or remove the timeout instead.
+
+Note this is different from :py:class:`doit.tools.timeout`, an
+``uptodate`` helper that only marks a task as out-of-date based on the
+wall-clock time of its last successful run.
+
+.. code-block:: python
+
+    def task_slow_cleanup():
+        return {
+            "actions": ["sh ./external-cleanup.sh"],
+            "timeout": 30,
+        }
+
+
 meta
 ----
 

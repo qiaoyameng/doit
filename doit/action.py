@@ -7,11 +7,67 @@ import subprocess
 import io
 from io import StringIO
 import inspect
+import signal
+import time
 from pathlib import PurePath
-from threading import Thread
+from threading import (
+    Thread,
+    current_thread as threading_current_thread,
+    main_thread as threading_main_thread,
+)
 import pdb
 
-from .exceptions import InvalidTask, TaskFailed, TaskError
+from .exceptions import InvalidTask, TaskFailed, TaskError, TaskTimeout
+
+
+# monotonic clock used to enforce task timeouts. It is a module attribute
+# so tests can replace it with a fully controllable fake clock.
+monotonic = time.monotonic
+
+# signal-based interruption of python actions is only available when
+# SIGALRM exists (POSIX) and the action runs on the main thread.
+SIGNAL_TIMEOUT_AVAILABLE = hasattr(signal, 'SIGALRM')
+
+
+class Deadline:
+    """Point in monotonic time at which a task must be finished.
+
+    The clock starts when the task actually starts executing, so time
+    spent queuing waiting for a runner slot is never counted.
+    """
+
+    def __init__(self, timeout, clock=None):
+        """@param timeout: (float) seconds, None means no time limit"""
+        self.timeout = timeout
+        self._clock = clock if clock is not None else monotonic
+        self.start = self._clock()
+
+    @property
+    def active(self):
+        """True if a time limit is in place"""
+        return self.timeout is not None
+
+    def remaining(self):
+        """seconds left until the deadline, never negative"""
+        if self.timeout is None:
+            return None
+        return max(0.0, self.timeout - (self._clock() - self.start))
+
+    def expired(self):
+        """True if the deadline was already reached"""
+        if self.timeout is None:
+            return False
+        return self._clock() - self.start >= self.timeout
+
+
+class _DeadlineReached(Exception):
+    """Internal signal raised by SIGALRM when a deadline fires.
+
+    ``TaskTimeout`` (like all ``BaseFail`` subclasses) is not a real
+    exception, so it cannot be raised/caught directly. This private
+    exception is converted into a ``TaskTimeout`` at the action boundary.
+    """
+    pass
 
 
 def normalize_callable(ref):
@@ -182,7 +238,7 @@ class CmdAction(BaseAction):
                 realtime.flush()  # required if on byte buffering mode
 
 
-    def execute(self, out=None, err=None):
+    def execute(self, out=None, err=None, deadline=None):
         """
         Execute command action
 
@@ -191,11 +247,13 @@ class CmdAction(BaseAction):
         @param out: None - no real time output
                     a file like object (has write method)
         @param err: idem
+        @param deadline: action.Deadline applying to the whole task
         @return failure:
             - None: if successful
             - TaskError: If subprocess return code is greater than 125
             - TaskFailed: If subprocess return code isn't zero (and
         not greater than 125)
+            - TaskTimeout: if the task deadline is reached
         """
         try:
             action = self.expand_action()
@@ -214,6 +272,17 @@ class CmdAction(BaseAction):
                 env = os.environ.copy()
             env['PYTHONUNBUFFERED'] = '1'
 
+        popen_kwargs = dict(
+            shell=self.shell,
+            # bufsize=2, # ??? no effect use PYTHONUNBUFFERED instead
+            env=env,
+            **subprocess_pkwargs)
+        # put the child in its own process group/session so the whole
+        # process tree (shell + its descendants) can be reaped together
+        # when a timeout fires.
+        if os.name == 'posix' and 'start_new_session' not in popen_kwargs:
+            popen_kwargs['start_new_session'] = True
+
         capture_io = self.task.io.capture if self.task else True
         if capture_io:
             p_out = p_err = subprocess.PIPE
@@ -227,12 +296,9 @@ class CmdAction(BaseAction):
         # spawn task process
         process = subprocess.Popen(
             action,
-            shell=self.shell,
-            # bufsize=2, # ??? no effect use PYTHONUNBUFFERED instead
             stdout=p_out,
             stderr=p_err,
-            env=env,
-            **subprocess_pkwargs)
+            **popen_kwargs)
 
         if capture_io:
             output = StringIO()
@@ -243,15 +309,24 @@ class CmdAction(BaseAction):
                            args=(process, process.stderr, errput, err))
             t_out.start()
             t_err.start()
-            t_out.join()
-            t_err.join()
+        else:
+            t_out = t_err = None
 
+        timeout_fired = self._wait_process(process, deadline)
+
+        if capture_io:
+            # readers terminate on EOF after the process is gone; on
+            # timeout join with a bound so we never block on a stuck pipe
+            t_out.join(5)
+            t_err.join(5)
+
+            # preserve whatever output was produced before the deadline
             self.out = output.getvalue()
             self.err = errput.getvalue()
             self.result = self.out + self.err
 
-        # make sure process really terminated
-        process.wait()
+        if timeout_fired:
+            return self._timeout_result(action, deadline.timeout)
 
         # task error - based on:
         # http://www.gnu.org/software/bash/manual/bashref.html#Exit-Status
@@ -268,6 +343,61 @@ class CmdAction(BaseAction):
         # save stdout in values
         if self.save_out:
             self.values[self.save_out] = self.out
+
+    def _wait_process(self, process, deadline):
+        """wait for process termination, honoring the task deadline.
+
+        On timeout terminate the process and all of its descendants.
+        @return: True if the deadline was reached
+        """
+        if deadline is None or not deadline.active:
+            process.wait()
+            return False
+
+        remaining = deadline.remaining()
+        try:
+            process.wait(remaining)
+        except subprocess.TimeoutExpired:
+            # the process might have exited at the exact same instant as
+            # the deadline. Give it one last non-blocking check so
+            # completion and timeout publish exactly one final result.
+            if process.poll() is not None:
+                return False
+            self._terminate_process_tree(process)
+            return True
+        return False
+
+    @staticmethod
+    def _terminate_process_tree(process):
+        """terminate the spawned process together with its children"""
+        if os.name == 'posix':
+            import signal as _signal
+            try:
+                os.killpg(os.getpgid(process.pid), _signal.SIGTERM)
+            except ProcessLookupError:
+                return
+            try:
+                process.wait(5)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(os.getpgid(process.pid), _signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait()
+        else:  # pragma: no cover - windows CI is not available here
+            process.terminate()
+            try:
+                process.wait(5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+
+    def _timeout_result(self, action, timeout):
+        """build the failure object for a timed-out command action"""
+        task_name = self.task.name if self.task else '<no-task>'
+        msg = ("Task '%s' timed out after %s seconds while running: %s"
+               % (task_name, timeout, action))
+        return TaskTimeout(msg)
 
 
     def expand_action(self):
@@ -426,7 +556,7 @@ class PythonAction(BaseAction):
         return BaseAction._prepare_kwargs(self.task, self.py_callable,
                                           self.args, self.kwargs)
 
-    def execute(self, out=None, err=None):
+    def execute(self, out=None, err=None, deadline=None):
         """Execute command action
 
         both stdout and stderr from the command are captured and saved
@@ -434,9 +564,30 @@ class PythonAction(BaseAction):
         @param out: None - no real time output
                     a file like object (has write method)
         @param err: idem
+        @param deadline: action.Deadline applying to the whole task
 
         @return failure: see CmdAction.execute
         """
+        if deadline is not None and deadline.active:
+            # A deadline already reached before the callable starts means
+            # the callable must never run, otherwise it could keep
+            # writing files after the task was already declared timed out.
+            if deadline.expired():
+                return self._timeout_result(deadline.timeout)
+            if not self._timeout_is_safe():
+                # cannot safely interrupt python code running on a
+                # non-main thread (e.g. MThreadRunner) or without SIGALRM.
+                # Refuse before executing instead of returning a timeout
+                # while the callable keeps running.
+                msg = (
+                    "Task '%s' has a timeout of %s seconds but python "
+                    "actions cannot be safely interrupted in this runner "
+                    "(no SIGALRM support or not running on the main "
+                    "thread). Use a CmdAction, run without the threaded "
+                    "runner, or remove the timeout."
+                    % (self.task.name, deadline.timeout))
+                raise InvalidTask(msg)
+
         capture_io = self.task.io.capture if self.task else True
 
         if capture_io:
@@ -469,8 +620,36 @@ class PythonAction(BaseAction):
         kwargs = self._prepare_kwargs()
 
         # execute action / callable
+        alarm_armed = False
+        previous_handler = None
+        callable_done = False
+        if (deadline is not None and deadline.active
+                and self._timeout_is_safe()):
+            # SIGALRM is delivered synchronously to the thread running the
+            # callable (the main thread), so the callable is interrupted
+            # instead of being left running in the background.
+            def _timeout_handler(signum, frame):
+                # if the callable already completed at the exact instant
+                # the deadline fired, keep the single success result
+                # instead of raising on top of it.
+                if callable_done:
+                    return
+                raise _DeadlineReached(
+                    self._timeout_message(deadline.timeout))
+
+            remaining = deadline.remaining()
+            # signal.setitimer needs a strictly positive value
+            if remaining <= 0:
+                return self._timeout_result(deadline.timeout)
+            previous_handler = signal.signal(
+                signal.SIGALRM, _timeout_handler)
+            signal.setitimer(signal.ITIMER_REAL, remaining)
+            alarm_armed = True
         try:
             returned_value = self.py_callable(*self.args, **kwargs)
+            callable_done = True
+        except _DeadlineReached as exception:
+            return self._timeout_result(deadline.timeout, exception)
         except Exception as exception:
             if self.pm_pdb:  # pragma: no cover
                 # start post-mortem debugger
@@ -479,6 +658,9 @@ class PythonAction(BaseAction):
                 deb.interaction(None, sys.exc_info()[2])
             return TaskError("PythonAction Error", exception)
         finally:
+            if alarm_armed:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+                signal.signal(signal.SIGALRM, previous_handler)
             # restore std streams /log captured streams
             if capture_io:
                 sys.stdout = old_stdout
@@ -511,6 +693,26 @@ class PythonAction(BaseAction):
                              "returned %s (%s)" %
                              (self.py_callable, returned_value,
                               type(returned_value)))
+
+    @staticmethod
+    def _timeout_is_safe():
+        """True only if a running callable can really be interrupted.
+
+        SIGALRM interrupts are delivered to the main thread only, and
+        SIGALRM does not exist on Windows. Anything else must be refused
+        before the callable starts.
+        """
+        return (SIGNAL_TIMEOUT_AVAILABLE and
+                threading_current_thread() is threading_main_thread())
+
+    def _timeout_message(self, timeout):
+        task_name = self.task.name if self.task else '<no-task>'
+        return ("Task '%s' timed out after %s seconds while executing "
+                "python action %s"
+                % (task_name, timeout, self.py_callable))
+
+    def _timeout_result(self, timeout, exception=None):
+        return TaskTimeout(self._timeout_message(timeout), exception)
 
     def __str__(self):
         # get object description excluding runtime memory address

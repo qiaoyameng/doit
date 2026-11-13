@@ -49,6 +49,7 @@ class Info(DoitCmdBase):
             ('getargs', 'dict'),
             ('params', 'list'),
             ('verbosity', 'scalar'),
+            ('timeout', 'scalar'),
             ('watch', 'list'),
             ('meta', 'dict')
         )

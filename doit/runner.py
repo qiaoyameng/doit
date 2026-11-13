@@ -1,5 +1,6 @@
 """Task runner"""
 
+import inspect
 from multiprocessing import Process, Queue as MQueue
 from threading import Thread
 import pickle
@@ -11,15 +12,30 @@ try:
 except ImportError:
     pickle_dumps = pickle.dumps
 
-from .exceptions import InvalidTask, BaseFail
 from .exceptions import TaskFailed, SetupError, DependencyError, UnmetDependency
+from .exceptions import InvalidTask, BaseFail
 from .task import Stream, DelayedLoaded
+from .action import PythonAction, SIGNAL_TIMEOUT_AVAILABLE
 
 
 # execution result.
 SUCCESS = 0
 FAILURE = 1
 ERROR = 2
+
+
+def _action_accepts_deadline(action):
+    """True if the action's execute() can receive a timeout deadline."""
+    try:
+        signature = inspect.signature(action.execute)
+    except (TypeError, ValueError):
+        return False
+    return any(
+        param.kind == inspect.Parameter.KEYWORD_ONLY
+        or param.kind == inspect.Parameter.VAR_KEYWORD
+        for param in signature.parameters.values()) or \
+        "deadline" in signature.parameters
+
 
 class Runner():
     """Task runner
@@ -112,6 +128,7 @@ class Runner():
 
         # if run_status is not None, it was already calculated
         if node.run_status is None:
+            self._check_timeout_supported(task)
 
             self.reporter.get_status(task)
 
@@ -168,6 +185,45 @@ class Runner():
 
         return True
 
+    def _check_timeout_supported(self, task):
+        """Validate the task timeout can be enforced by this runner.
+
+        Timeouts are enforced by passing a deadline to each action.
+        A python action can only be interrupted via SIGALRM on the main
+        thread; threaded workers (and platforms without SIGALRM) cannot
+        stop a running callable safely. Custom actions that predate the
+        ``deadline`` keyword (e.g. doit.tools.LongRunning) cannot honor
+        it either. Every unsupported combination is refused before any
+        action starts, instead of returning a timeout while work keeps
+        running in the background.
+        """
+        if not task.timeout:
+            return
+        python_interruptible = (
+            SIGNAL_TIMEOUT_AVAILABLE is True
+            and self._runs_on_main_thread())
+        for action in task.actions:
+            if isinstance(action, PythonAction):
+                if not python_interruptible:
+                    msg = (
+                        "Task '%s' has a timeout of %s seconds but python "
+                        "actions cannot be safely interrupted by this "
+                        "runner (no SIGALRM support or execution outside "
+                        "the main thread). Use a CmdAction, the "
+                        "serial/process runner, or remove the timeout."
+                        % (task.name, task.timeout))
+                    raise InvalidTask(msg)
+            elif not _action_accepts_deadline(action):
+                msg = (
+                    "Task '%s' has a timeout of %s seconds but action "
+                    "%r does not support a timeout deadline. Use a "
+                    "regular CmdAction/PythonAction or remove the "
+                    "timeout." % (task.name, task.timeout, action))
+                raise InvalidTask(msg)
+
+    def _runs_on_main_thread(self):
+        """True if task actions execute on the process' main thread"""
+        return True
 
     def execute_task(self, task):
         """execute task's actions"""
@@ -575,3 +631,8 @@ class MThreadRunner(MRunner):
     @staticmethod
     def available():
         return True
+
+    def _runs_on_main_thread(self):
+        # actions execute inside DaemonThread workers, SIGALRM can not
+        # interrupt them safely.
+        return False

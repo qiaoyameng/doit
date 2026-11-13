@@ -951,3 +951,153 @@ class TestMThreadRunner_available(unittest.TestCase):
     def test_MThreadRunner_available(self):
         self.assertTrue(runner.MThreadRunner.available())
 
+
+
+# ---------------------------------------------------------------------------
+# Transactional delayed loader batches: executed-action recording
+# ---------------------------------------------------------------------------
+
+_BATCH_ACTIONS = []
+
+
+def _record_action(name):
+    _BATCH_ACTIONS.append(name)
+
+
+def _make_record_task(name):
+    return Task(name, [(_record_action, [name])])
+
+
+class TestRunnerDelayedBatch(DepManagerMixin, unittest.TestCase):
+    """a failed delayed batch must never reach the runner, while the
+    already loaded graph keeps running"""
+
+    def setUp(self):
+        super().setUp()
+        self.reporter = FakeReporter()
+        _BATCH_ACTIONS.clear()
+
+    def _executed_names(self):
+        return [entry[1].name for entry in self.reporter.log
+                if entry[0] == 'execute']
+
+    def _run(self, tasks_dict, selection):
+        my_runner = runner.Runner(self.dep_manager, self.reporter)
+        result = my_runner.run_all(
+            TaskDispatcher(tasks_dict, [], selection))
+        return result, my_runner
+
+    def test_exception_batch_executes_no_new_actions(self):
+        def failing_creator():
+            for index in range(1, 10):
+                yield {'name': f'n{index}',
+                       'actions': [(_record_action, [f'n{index}'])]}
+            raise RuntimeError('boom on the 10th task')
+
+        loader = DelayedLoader(failing_creator, executed='base')
+        base = _make_record_task('base')
+        placeholder = Task('dl', None, loader=loader)
+        result, _ = self._run(
+            {'base': base, 'dl': placeholder}, ['dl'])
+
+        self.assertEqual(runner.ERROR, result)
+        # only the already loaded dependency ran, zero batch actions
+        self.assertEqual(['base'], _BATCH_ACTIONS)
+        self.assertEqual(['base'], self._executed_names())
+        self.assertTrue(loader.created and loader.failed)
+        self.assertIn(('runtime_error',), self.reporter.log)
+
+    def test_cyclic_batch_executes_no_new_actions(self):
+        def cyclic_creator():
+            yield {'name': 'a', 'actions': None,
+                   'task_dep': ['dl:b']}
+            yield {'name': 'b', 'actions': None,
+                   'task_dep': ['dl:a']}
+
+        loader = DelayedLoader(cyclic_creator, executed='base')
+        base = _make_record_task('base')
+        placeholder = Task('dl', None, loader=loader)
+        result, _ = self._run(
+            {'base': base, 'dl': placeholder}, ['dl'])
+
+        self.assertEqual(runner.ERROR, result)
+        self.assertEqual(['base'], _BATCH_ACTIONS)
+        self.assertTrue(loader.failed)
+
+    def test_duplicate_target_batch_executes_no_new_actions(self):
+        def colliding_creator():
+            yield {'basename': 'owner2', 'actions': None,
+                   'targets': ['shared']}
+
+        loader = DelayedLoader(colliding_creator, executed='base')
+        base = _make_record_task('base')
+        owner1 = Task('owner1', None, targets=['shared'])
+        placeholder = Task('dl', None, loader=loader)
+        result, _ = self._run(
+            {'base': base, 'owner1': owner1, 'dl': placeholder}, ['dl'])
+
+        self.assertEqual(runner.ERROR, result)
+        self.assertEqual(['base'], _BATCH_ACTIONS)
+        self.assertTrue(loader.failed)
+
+    def test_normal_batch_executes_all_actions_once(self):
+        def good_creator():
+            for index in range(1, 11):
+                yield {'name': f'n{index}',
+                       'actions': [(_record_action, [f'n{index}'])]}
+
+        loader = DelayedLoader(good_creator, executed='base')
+        base = _make_record_task('base')
+        placeholder = Task('dl', None, loader=loader)
+        result, _ = self._run(
+            {'base': base, 'dl': placeholder}, ['dl'])
+
+        self.assertEqual(runner.SUCCESS, result)
+        expected = ['base'] + [f'n{index}' for index in range(1, 11)]
+        self.assertEqual(expected, _BATCH_ACTIONS)
+        # every action ran exactly once
+        self.assertEqual(len(expected), len(_BATCH_ACTIONS))
+        self.assertTrue(loader.created and not loader.failed)
+
+    def test_successful_dependency_is_not_re_executed(self):
+        import os
+        target_path = os.path.join(self._dep_tmpdir, 'base_target')
+        source_path = os.path.join(self._dep_tmpdir, 'base_source')
+        with open(source_path, 'w') as handle:
+            handle.write('stable input')
+
+        def write_base_target():
+            _record_action('base')
+            with open(target_path, 'w') as handle:
+                handle.write('base output')
+
+        def good_creator():
+            yield {'name': 'n1',
+                   'actions': [(_record_action, ['n1'])]}
+
+        # first run: base + generated task both execute
+        loader = DelayedLoader(good_creator, executed='base')
+        base = Task('base', [write_base_target],
+                    file_dep=[source_path], targets=[target_path])
+        placeholder = Task('dl', None, loader=loader)
+        result, my_runner = self._run(
+            {'base': base, 'dl': placeholder}, ['dl'])
+        self.assertEqual(runner.SUCCESS, result)
+        self.assertEqual(['base', 'n1'], _BATCH_ACTIONS)
+        self.assertTrue(os.path.exists(target_path))
+        my_runner.finish()
+
+        # a second run reuses the persisted success state, so the base
+        # dependency is not executed again
+        loader2 = DelayedLoader(good_creator, executed='base')
+        base2 = Task('base', [write_base_target],
+                     file_dep=[source_path], targets=[target_path])
+        placeholder2 = Task('dl', None, loader=loader2)
+        result2, my_runner2 = self._run(
+            {'base': base2, 'dl': placeholder2}, ['dl'])
+        self.assertEqual(runner.SUCCESS, result2)
+        my_runner2.finish()
+        # base ran only on the first run; n1 is re-created per run and
+        # executed each time because its loader is a fresh instance
+        self.assertEqual(['base', 'n1', 'n1'], _BATCH_ACTIONS)
+        self.assertEqual(1, _BATCH_ACTIONS.count('base'))

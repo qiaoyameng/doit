@@ -36,12 +36,16 @@ class DelayedLoader:
     :ivar target_regex: (str) regex for all targets that this loader tasks
                         will create
     :ivar created: (bool) whether this creator was already executed or not
+    :ivar failed: (bool) the creator was executed but the generated batch
+                   could not be validated/published, so the loader must not
+                   be re-run to restore state
     """
     def __init__(self, creator, executed=None, target_regex=None, creates=None):
         self.creator = creator
         self.task_dep = executed
         self.basename = None
         self.created = False
+        self.failed = False
         self.target_regex = target_regex
         self.creates = creates[:] if creates else []
         self.regex_groups = OrderedDict()  # task_name:RegexGroup

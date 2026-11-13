@@ -3,7 +3,7 @@ from collections import deque
 
 from doit.exceptions import InvalidDodoFile, InvalidCommand
 from doit.task import Stream, InvalidTask, Task, DelayedLoader
-from doit.control import TaskControl, TaskDispatcher, ExecNode
+from doit.control import TaskControl, TaskDispatcher, ExecNode, TaskBatch
 from doit.control import no_none
 
 
@@ -809,3 +809,324 @@ class TestTaskDispatcher_dispatcher_generator(unittest.TestCase):
         nt0 = gen.send(nt1)
         self.assertEqual(nt0.task.name, "t0")
         self.assertRaises(StopIteration, next, gen)
+
+
+# ---------------------------------------------------------------------------
+# Transactional publication of delayed loader batches
+# ---------------------------------------------------------------------------
+
+class TestTaskBatch(unittest.TestCase):
+    """validation runs against a staging area, nothing leaks on failure"""
+
+    def _control(self, tasks):
+        control = TaskControl(tasks)
+        control.process(None)
+        return control
+
+    def test_valid_batch_is_committed(self):
+        loader = DelayedLoader(lambda: None)
+        t1 = Task('t1', None, loader=loader)
+        t2 = Task('t2', None)
+        control = self._control([t1, t2])
+        new_tasks = [
+            Task('n1', None, task_dep=['t2']),
+            Task('n2', None, targets=['f1']),
+        ]
+        batch = TaskBatch(control, loader, 't1', new_tasks)
+        batch.validate()
+        batch.commit()
+        self.assertIn('n1', control.tasks)
+        self.assertIn('n2', control.tasks)
+        self.assertEqual(control.targets['f1'], 'n2')
+
+    def test_duplicate_name_against_published_task(self):
+        loader = DelayedLoader(lambda: None)
+        t1 = Task('t1', None, loader=loader)
+        t2 = Task('t2', None)
+        control = self._control([t1, t2])
+        batch = TaskBatch(control, loader, 't1',
+                          [Task('t2', None)])
+        with self.assertRaises(InvalidTask) as cm:
+            batch.validate()
+        self.assertIn('t1', str(cm.exception))  # generating source
+        self.assertIn('t2', str(cm.exception))  # colliding task
+        self.assertIs(control.tasks['t2'], t2)  # original untouched
+
+    def test_duplicate_name_inside_batch(self):
+        loader = DelayedLoader(lambda: None)
+        t1 = Task('t1', None, loader=loader)
+        control = self._control([t1])
+        batch = TaskBatch(control, loader, 't1',
+                          [Task('dup', None), Task('dup', None)])
+        self.assertRaises(InvalidTask, batch.validate)
+        self.assertNotIn('dup', control.tasks)
+
+    def test_placeholder_from_same_loader_may_be_replaced(self):
+        # subtask placeholders share the loader and are replaced by the
+        # real generated tasks, this is not a name conflict
+        loader = DelayedLoader(lambda: None)
+        loader.basename = 't1'
+        t1 = Task('t1', None, loader=loader)
+        placeholder = Task('t1:foo', None, loader=loader)
+        control = self._control([t1, placeholder])
+        real = Task('t1:foo', None)
+        batch = TaskBatch(control, loader, 't1', [real])
+        batch.validate()  # must not raise
+        batch.commit()
+        self.assertIs(control.tasks['t1:foo'], real)
+
+    def test_target_already_owned(self):
+        loader = DelayedLoader(lambda: None)
+        t1 = Task('t1', None, loader=loader)
+        owner = Task('owner', None, targets=['shared'])
+        control = self._control([t1, owner])
+        batch = TaskBatch(
+            control, loader, 't1',
+            [Task('n1', None, targets=['shared'])])
+        with self.assertRaises(InvalidTask) as cm:
+            batch.validate()
+        self.assertIn('shared', str(cm.exception))
+        self.assertIn('owner', str(cm.exception))
+        self.assertEqual(control.targets, {'shared': 'owner'})
+
+    def test_duplicate_target_inside_batch(self):
+        loader = DelayedLoader(lambda: None)
+        t1 = Task('t1', None, loader=loader)
+        control = self._control([t1])
+        batch = TaskBatch(
+            control, loader, 't1',
+            [Task('a', None, targets=['x']),
+             Task('b', None, targets=['x'])])
+        self.assertRaises(InvalidTask, batch.validate)
+        self.assertNotIn('x', control.targets)
+
+    def test_unknown_task_dependency(self):
+        loader = DelayedLoader(lambda: None)
+        t1 = Task('t1', None, loader=loader)
+        control = self._control([t1])
+        batch = TaskBatch(
+            control, loader, 't1',
+            [Task('n1', None, task_dep=['ghost'])])
+        with self.assertRaises(InvalidTask) as cm:
+            batch.validate()
+        self.assertIn('n1', str(cm.exception))
+        self.assertIn('ghost', str(cm.exception))
+        self.assertNotIn('n1', control.tasks)
+
+    def test_unknown_calc_dependency(self):
+        loader = DelayedLoader(lambda: None)
+        t1 = Task('t1', None, loader=loader)
+        control = self._control([t1])
+        batch = TaskBatch(
+            control, loader, 't1',
+            [Task('n1', None, calc_dep=['ghost'])])
+        self.assertRaises(InvalidTask, batch.validate)
+        self.assertNotIn('n1', control.tasks)
+
+    def test_cycle_inside_batch(self):
+        loader = DelayedLoader(lambda: None)
+        t1 = Task('t1', None, loader=loader)
+        control = self._control([t1])
+        batch = TaskBatch(
+            control, loader, 't1',
+            [Task('a', None, task_dep=['b']),
+             Task('b', None, task_dep=['a'])])
+        with self.assertRaises(InvalidTask) as cm:
+            batch.validate()
+        self.assertIn('cyclic', str(cm.exception).lower())
+        self.assertNotIn('a', control.tasks)
+        self.assertNotIn('b', control.tasks)
+
+    def test_cycle_reaching_back_into_existing_graph(self):
+        loader = DelayedLoader(lambda: None)
+        # an existing task depends on a batch task that points back to it,
+        # forming a cycle across the batch boundary
+        t1 = Task('t1', None, loader=loader)
+        control = self._control([t1])
+        t1.task_dep.append('t1:a')
+        batch = TaskBatch(
+            control, loader, 't1',
+            [Task('t1:a', None, task_dep=['t1'])])
+        self.assertRaises(InvalidTask, batch.validate)
+        self.assertNotIn('t1:a', control.tasks)
+
+    def test_rollback_restores_targets(self):
+        loader = DelayedLoader(lambda: None)
+        t1 = Task('t1', None, loader=loader)
+        control = self._control([t1])
+        batch = TaskBatch(
+            control, loader, 't1',
+            [Task('n1', None, targets=['new_tgt'])])
+        batch.targets_snapshot = dict(control.targets)
+        # simulate a half-applied commit
+        control.targets['new_tgt'] = 'n1'
+        control.tasks['n1'] = batch.new_tasks[0]
+        batch.rollback()
+        self.assertNotIn('new_tgt', control.targets)
+        self.assertNotIn('n1', control.tasks)
+
+
+class TestDelayedLoaderTransaction(unittest.TestCase):
+    """end-to-end batch publication through the TaskDispatcher"""
+
+    def _start_loader(self, tasks_dict, placeholder_name='dl'):
+        """drive the placeholder node's inner generator up to the point
+        the loader creator is about to be invoked. The next value pulled
+        from the returned generator triggers the batch transaction."""
+        dispatcher = TaskDispatcher(tasks_dict, [], None)
+        node = dispatcher._gen_node(None, placeholder_name)
+        gen = dispatcher._add_task(node)
+        dep_nodes = []
+        while True:
+            step = next(gen)
+            if step == 'wait':
+                break
+            self.assertIsInstance(step, ExecNode)
+            dep_nodes.append(step)
+        # satisfy every dependency the placeholder is waiting for, then
+        # resume; the next `next()` invokes the loader transaction
+        for dep_node in dep_nodes:
+            dep_node.run_status = 'successful'
+            dispatcher._update_waiting(dep_node)
+        return dispatcher, node, gen
+        return dispatcher, node, gen
+
+    def test_loader_exception_publishes_nothing_and_consumes_generator(self):
+        consumed = []
+
+        def failing_creator():
+            for name in ('n1', 'n2', 'n3'):
+                consumed.append(name)
+                yield {'name': name, 'actions': None}
+            raise RuntimeError('boom on the 10th item')
+
+        loader = DelayedLoader(failing_creator, executed='base')
+        base = Task('base', None)
+        placeholder = Task('dl', None, loader=loader)
+        tasks_dict = {'base': base, 'dl': placeholder}
+        dispatcher, node, gen = self._start_loader(tasks_dict)
+
+        # the creator raises while the batch is being collected; the
+        # failure is wrapped into an InvalidTask naming the source loader
+        with self.assertRaises(InvalidTask) as cm:
+            next(gen)
+        self.assertIn('dl', str(cm.exception))
+        self.assertIn('RuntimeError', str(cm.exception))
+
+        # the generator was consumed once, none of its tasks leaked
+        self.assertEqual(consumed, ['n1', 'n2', 'n3'])
+        self.assertNotIn('n1', tasks_dict)
+        self.assertNotIn('n2', tasks_dict)
+        self.assertNotIn('n3', tasks_dict)
+        # loader is spent, re-driving it must not re-invoke the creator
+        self.assertTrue(loader.created)
+        self.assertTrue(loader.failed)
+        self.assertIs(placeholder.loader, loader)
+        again = dispatcher._add_task(node)
+        self.assertEqual('reset generator', next(again))
+        self.assertEqual(consumed, ['n1', 'n2', 'n3'])
+
+    def test_cyclic_batch_publishes_nothing(self):
+        def cyclic_creator():
+            yield {'name': 'a', 'actions': None,
+                   'task_dep': ['dl:b']}
+            yield {'name': 'b', 'actions': None,
+                   'task_dep': ['dl:a']}
+
+        loader = DelayedLoader(cyclic_creator, executed='base')
+        base = Task('base', None)
+        placeholder = Task('dl', None, loader=loader)
+        tasks_dict = {'base': base, 'dl': placeholder}
+        dispatcher, node, gen = self._start_loader(tasks_dict)
+
+        self.assertRaises(InvalidTask, next, gen)
+        self.assertNotIn('dl:a', tasks_dict)
+        self.assertNotIn('dl:b', tasks_dict)
+        self.assertTrue(loader.failed)
+        # original graph is still intact and executable
+        self.assertIn('base', tasks_dict)
+        self.assertIn('dl', tasks_dict)
+
+    def test_valid_batch_is_published_and_resets_placeholder(self):
+        created = []
+
+        def good_creator():
+            for name in ('n1', 'n2'):
+                created.append(name)
+                yield {'name': name, 'actions': None}
+
+        loader = DelayedLoader(good_creator, executed='base')
+        base = Task('base', None)
+        placeholder = Task('dl', None, loader=loader)
+        tasks_dict = {'base': base, 'dl': placeholder}
+        dispatcher, node, gen = self._start_loader(tasks_dict)
+
+        self.assertEqual('reset generator', next(gen))
+        self.assertIn('dl:n1', tasks_dict)
+        self.assertIn('dl:n2', tasks_dict)
+        self.assertTrue(loader.created)
+        self.assertFalse(loader.failed)
+        self.assertEqual(created, ['n1', 'n2'])
+
+    def test_failed_batch_leaves_no_duplicate_on_fixed_rerun(self):
+        # first run: the batch redefines a task name already in the graph
+        def bad_creator():
+            yield {'basename': 'other', 'actions': None}
+
+        loader = DelayedLoader(bad_creator, executed='base')
+        base = Task('base', None)
+        other = Task('other', None)
+        placeholder = Task('dl', None, loader=loader)
+        tasks_dict = {'base': base, 'other': other, 'dl': placeholder}
+        dispatcher, node, gen = self._start_loader(tasks_dict)
+        self.assertRaises(InvalidTask, next, gen)
+        self.assertIs(tasks_dict['other'], other)
+        self.assertTrue(loader.failed)
+
+        # a fresh run with a corrected generator starts clean: no node
+        # from the failed batch survived into the new graph
+        def fixed_creator():
+            yield {'basename': 'fresh', 'actions': None}
+
+        loader2 = DelayedLoader(fixed_creator, executed='base')
+        base2 = Task('base', None)
+        other2 = Task('other', None)
+        placeholder2 = Task('dl', None, loader=loader2)
+        tasks_dict2 = {'base': base2, 'other': other2, 'dl': placeholder2}
+        dispatcher2, node2, gen2 = self._start_loader(tasks_dict2)
+        self.assertEqual('reset generator', next(gen2))
+        self.assertIn('fresh', tasks_dict2)
+        # the original 'other' node is the only one with that name, no
+        # duplicated node leaked from the previous failed batch
+        self.assertIs(tasks_dict2['other'], other2)
+
+
+class TestCalcDepTransaction(unittest.TestCase):
+    """calc_dep results are validated and published atomically"""
+
+    def test_cyclic_calc_dep_edges_are_rejected(self):
+        tasks = {'t1': Task('t1', None, calc_dep=['t2']),
+                 't2': Task('t2', None)}
+        td = TaskDispatcher(tasks, [], None)
+        n1 = td._gen_node(None, 't1')
+        n2 = td._gen_node(None, 't2')
+        # t1 would end up depending on itself
+        n2.task.values = {'task_dep': ['t1']}
+        self.assertRaises(InvalidTask,
+                          td._process_calc_dep_results, n2, n1)
+        # nothing was published
+        self.assertEqual(n1.task.task_dep, [])
+        self.assertEqual(n1.task_dep, [])
+
+    def test_valid_calc_dep_edges_are_committed(self):
+        tasks = {'t1': Task('t1', None, calc_dep=['t2']),
+                 't2': Task('t2', None),
+                 't3': Task('t3', None)}
+        td = TaskDispatcher(tasks, [], None)
+        n1 = td._gen_node(None, 't1')
+        n2 = td._gen_node(None, 't2')
+        n2.task.values = {'task_dep': ['t3'], 'calc_dep': ['t3']}
+        td._process_calc_dep_results(n2, n1)
+        self.assertEqual(n1.task.task_dep, ['t3'])
+        self.assertEqual(n1.task_dep, ['t3'])
+        self.assertEqual(n1.calc_dep, {'t2', 't3'})

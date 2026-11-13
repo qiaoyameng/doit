@@ -22,6 +22,172 @@ class RegexGroup:
         self.found = False
 
 
+def _detect_cycle(graph, start):
+    """DFS cycle detection on a task dependency graph.
+
+    @param graph: (dict) task name -> iterable of task dependency names
+    @param start: (str) task name where the search starts
+    @return: (list - str) names forming a cycle, empty list if no cycle
+    """
+    path = []
+    on_path = set()
+
+    def visit(name):
+        if name in on_path:
+            return path[path.index(name):] + [name]
+        on_path.add(name)
+        path.append(name)
+        for dep in graph.get(name, ()):
+            cycle = visit(dep)
+            if cycle:
+                return cycle
+        path.pop()
+        on_path.remove(name)
+        return []
+
+    return visit(start)
+
+
+class TaskBatch:
+    """Transactional collection of tasks produced by one DelayedLoader.
+
+    Tasks from a loader are fully collected and validated against the
+    current control graph before any of them are published. On validation
+    failure nothing is added to the control graph, so the already loaded
+    tasks remain executable.
+
+    :ivar loader: (DelayedLoader) source of the batch
+    :ivar source: (str) identifier of the task-creator (error messages)
+    :ivar new_tasks: (list - Task) tasks collected from the loader
+    :ivar new_names: (set - str) names introduced by this batch
+    :ivar targets_snapshot: (dict) backup of control targets touched
+    """
+    def __init__(self, control, loader, source, new_tasks):
+        self.control = control
+        self.loader = loader
+        self.source = source
+        self.new_tasks = new_tasks
+        self.new_names = {task.name for task in new_tasks}
+        self.targets_snapshot = None
+
+    def _error(self, message):
+        """raise an InvalidTask pointing at the generating source"""
+        names = ", ".join(sorted(self.new_names)) or self.source
+        raise InvalidTask(
+            f"Delayed loader '{self.source}' generated an invalid batch "
+            f"(tasks: {names}). {message}")
+
+    def validate(self):
+        """run all batch checks without mutating the control graph"""
+        self._check_duplicate_names()
+        self._check_target_ownership()
+        self._resolve_implicit_deps()
+        self._check_unknown_deps()
+        self._check_cycles()
+
+    def _check_duplicate_names(self):
+        """a task name can not be defined twice inside the batch or
+        collide with a task already visible to the scheduler
+
+        A generated task is allowed to replace a placeholder task owned
+        by this same loader (the parent placeholder or subtask/regex
+        placeholders sharing the loader). Those are not real duplicates.
+        """
+        seen = set()
+        for task in self.new_tasks:
+            if task.name in seen:
+                self._error(
+                    f"duplicate task name '{task.name}' inside the batch.")
+            seen.add(task.name)
+            existing = self.control.tasks.get(task.name)
+            if existing is not None and existing.loader is not self.loader:
+                self._error(
+                    f"task name '{task.name}' is already defined.")
+
+    def _check_target_ownership(self):
+        """targets must have a single owner, both inside the batch and
+        against targets already published"""
+        batch_owner = {}
+        for task in self.new_tasks:
+            for target in task.targets:
+                if target in batch_owner:
+                    self._error(
+                        f"target '{target}' is produced by both "
+                        f"'{batch_owner[target]}' and '{task.name}'.")
+                batch_owner[target] = task.name
+                if target in self.control.targets:
+                    self._error(
+                        f"target '{target}' is already a target of task "
+                        f"'{self.control.targets[target]}'.")
+
+    def _resolve_implicit_deps(self):
+        """populate implicit task_dep from file_dep on a throw-away
+        target map, so validation sees the edges the commit would add"""
+        tentative_targets = dict(self.control.targets)
+        tentative_targets.update(
+            (target, task.name)
+            for task in self.new_tasks for target in task.targets)
+        for task in self.new_tasks:
+            TaskControl.add_implicit_task_dep(
+                tentative_targets, task, task.file_dep)
+
+    def _check_unknown_deps(self):
+        """task_dep/calc_dep/setup must resolve after the batch is added"""
+        known = set(self.control.tasks) | self.new_names
+        for task in self.new_tasks:
+            for dep in task.task_dep:
+                if dep not in known:
+                    self._error(
+                        f"task '{task.name}' depends on unknown task "
+                        f"'{dep}'.")
+            for dep in task.calc_dep:
+                if dep not in known:
+                    self._error(
+                        f"task '{task.name}' has calc_dep on unknown task "
+                        f"'{dep}'.")
+            for setup_task in task.setup_tasks:
+                if setup_task not in known:
+                    self._error(
+                        f"task '{task.name}' has invalid setup task "
+                        f"'{setup_task}'.")
+
+    def _check_cycles(self):
+        """detect cycles introduced by the batch, including implicit
+        task_dep generated from file_dep/targets"""
+        graph = {
+            name: list(task.task_dep)
+            for name, task in self.control.tasks.items()}
+        for task in self.new_tasks:
+            graph[task.name] = list(task.task_dep)
+        for start in self.new_names:
+            cycle = _detect_cycle(graph, start)
+            if cycle:
+                self._error(
+                    "cyclic dependency introduced: "
+                    + " -> ".join(cycle) + ".")
+
+    def commit(self):
+        """publish the validated batch into the control graph atomically"""
+        self.targets_snapshot = dict(self.control.targets)
+        try:
+            TaskControl.set_implicit_deps(self.control.targets,
+                                          self.new_tasks)
+            for task in self.new_tasks:
+                self.control.tasks[task.name] = task
+        except Exception:
+            # restore any partially mutated state before re-raising
+            self.rollback()
+            raise
+
+    def rollback(self):
+        """remove every trace left by a batch that failed to publish"""
+        if self.targets_snapshot is not None:
+            self.control.targets.clear()
+            self.control.targets.update(self.targets_snapshot)
+        for name in self.new_names:
+            self.control.tasks.pop(name, None)
+
+
 class TaskControl:
     """Manages tasks inter-relationship
 
@@ -469,13 +635,37 @@ class TaskDispatcher:
             to_load = this_task.loader.basename or this_task.name
             this_loader = self.tasks[to_load].loader
             if this_loader and not this_loader.created:
-                task_gen = ref(**this_loader.kwargs) if this_loader.kwargs else ref()
-                new_tasks = generate_tasks(to_load, task_gen, ref.__doc__)
-                TaskControl.set_implicit_deps(self.targets, new_tasks)
-                for nt in new_tasks:
-                    if not nt.loader:
-                        nt.loader = DelayedLoaded
-                    self.tasks[nt.name] = nt
+                # the generator is consumed exactly once. collect the
+                # whole batch into a staging area and validate it before
+                # any task becomes visible to the scheduler, so a failed
+                # batch leaves the already loaded graph untouched.
+                try:
+                    task_gen = (ref(**this_loader.kwargs)
+                                if this_loader.kwargs else ref())
+                    new_tasks = generate_tasks(
+                        to_load, task_gen, ref.__doc__)
+                    for nt in new_tasks:
+                        if not nt.loader:
+                            nt.loader = DelayedLoaded
+                    batch = TaskBatch(self, this_loader, to_load, new_tasks)
+                    batch.validate()
+                    batch.commit()
+                except InvalidTask:
+                    # validation errors already point at the source task
+                    this_loader.created = True
+                    this_loader.failed = True
+                    raise
+                except Exception as exception:
+                    # the creator raised while the batch was collected;
+                    # annotate the failure with the generating source and
+                    # make it a runtime error rather than a crash
+                    this_loader.created = True
+                    this_loader.failed = True
+                    raise InvalidTask(
+                        f"Delayed loader '{to_load}' failed while "
+                        f"generating its batch: "
+                        f"{exception.__class__.__name__}: {exception}"
+                    ) from exception
             # check itself for implicit dep (used by regex_target)
             TaskControl.add_implicit_task_dep(
                 self.targets, this_task, this_task.file_dep)
@@ -590,17 +780,55 @@ class TaskDispatcher:
     def _process_calc_dep_results(self, node, waiting_node):
         # refresh this task dependencies with values got from calc_dep
         values = node.task.values
-        len_task_deps = len(waiting_node.task.task_dep)
-        old_calc_dep = waiting_node.task.calc_dep.copy()
-        waiting_node.task.update_deps(values)
-        TaskControl.add_implicit_task_dep(
-            self.targets, waiting_node.task,
-            values.get('file_dep', []))
+        task = waiting_node.task
+
+        # edges produced by calc_dep follow the same all-or-nothing
+        # publish rule as a delayed loader batch: compute the resulting
+        # dependency set on a snapshot, validate it, and only then mutate
+        # the task/node that is visible to the scheduler.
+        snapshot_task_dep = list(task.task_dep)
+        snapshot_calc_dep = set(task.calc_dep)
+        snapshot_file_dep = set(task.file_dep)
+        snapshot_wild_dep = list(task.wild_dep)
+        snapshot_uptodate = list(task.uptodate)
+
+        try:
+            task.update_deps(values)
+            TaskControl.add_implicit_task_dep(
+                self.targets, task, values.get('file_dep', []))
+
+            new_task_dep = task.task_dep[len(snapshot_task_dep):]
+            new_calc_dep = task.calc_dep - snapshot_calc_dep
+
+            # a calc_dep result is allowed to name a task which is not
+            # known yet (it might be produced later by another delayed
+            # loader), so unknown names are not rejected here. the edges
+            # are still validated for cycles and published atomically.
+            graph = {
+                name: list(other.task_dep)
+                for name, other in self.tasks.items()}
+            graph[task.name] = list(task.task_dep)
+            for dep in new_task_dep:
+                if dep not in graph:
+                    continue
+                cycle = _detect_cycle(graph, dep)
+                if cycle:
+                    msg = (f"calc_dep from task '{node.task.name}' would "
+                           f"introduce a cyclic dependency for task "
+                           f"'{task.name}': "
+                           + " -> ".join(cycle) + ".")
+                    raise InvalidTask(msg)
+        except BaseException:
+            # rollback the tentative edges, the graph stays consistent
+            task.task_dep = snapshot_task_dep
+            task.calc_dep = snapshot_calc_dep
+            task.file_dep = snapshot_file_dep
+            task.wild_dep = snapshot_wild_dep
+            task.uptodate = snapshot_uptodate
+            raise
 
         # update node's list of non-processed dependencies
-        new_task_dep = waiting_node.task.task_dep[len_task_deps:]
         waiting_node.task_dep.extend(new_task_dep)
-        new_calc_dep = waiting_node.task.calc_dep - old_calc_dep
         waiting_node.calc_dep.update(new_calc_dep)
 
 

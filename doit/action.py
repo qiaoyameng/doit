@@ -205,13 +205,36 @@ class CmdAction(BaseAction):
 
         # set environ to change output buffering
         subprocess_pkwargs = self.pkwargs.copy()
-        env = None
+        action_env = None
         if 'env' in subprocess_pkwargs:
-            env = subprocess_pkwargs['env']
+            action_env = subprocess_pkwargs['env']
             del subprocess_pkwargs['env']
+
+        task_env = None
+        if (self.task is not None
+                and getattr(self.task, 'env_requires_injection', False)):
+            # always copy: Popen gets an independent environment and the
+            # fixed task snapshot must never be mutated here.
+            task_env = dict(self.task.get_env_snapshot())
+
+        if task_env is None:
+            env = action_env
+        else:
+            env = dict(task_env)
+            if action_env:
+                for name, value in action_env.items():
+                    if value is None:
+                        env.pop(name, None)
+                    else:
+                        env[name] = str(value)
+
         if self.buffering:
-            if not env:
+            # preserve the old behavior for action-level env: an empty
+            # mapping without a task environment means inherit.
+            if env is None or (task_env is None and not env):
                 env = os.environ.copy()
+            else:
+                env = dict(env)
             env['PYTHONUNBUFFERED'] = '1'
 
         capture_io = self.task.io.capture if self.task else True
@@ -439,6 +462,20 @@ class PythonAction(BaseAction):
         """
         capture_io = self.task.io.capture if self.task else True
 
+        task_env = None
+        if (self.task is not None
+                and getattr(self.task, 'env_requires_injection', False)):
+            if not getattr(self.task, '_env_isolated', False):
+                task_name = getattr(self.task, 'name', '<unknown>')
+                msg = (
+                    "PythonAction for task '%s' declares 'env' but is not "
+                    "running in an isolated process. Refusing to modify the "
+                    "process-wide environment; use a CmdAction or execute "
+                    "with process-based isolation (--parallel-type process)."
+                    % task_name)
+                return TaskError(msg)
+            task_env = dict(self.task.get_env_snapshot())
+
         if capture_io:
             # set std stream
             old_stdout = sys.stdout
@@ -468,6 +505,15 @@ class PythonAction(BaseAction):
 
         kwargs = self._prepare_kwargs()
 
+        # In an isolated worker the process-wide os.environ can be temporarily
+        # provided with the task snapshot. It is always restored. In shared
+        # execution modes execution was refused above.
+        old_env = None
+        if task_env is not None:
+            old_env = os.environ.copy()
+            os.environ.clear()
+            os.environ.update(task_env)
+
         # execute action / callable
         try:
             returned_value = self.py_callable(*self.args, **kwargs)
@@ -479,6 +525,9 @@ class PythonAction(BaseAction):
                 deb.interaction(None, sys.exc_info()[2])
             return TaskError("PythonAction Error", exception)
         finally:
+            if old_env is not None:
+                os.environ.clear()
+                os.environ.update(old_env)
             # restore std streams /log captured streams
             if capture_io:
                 sys.stdout = old_stdout

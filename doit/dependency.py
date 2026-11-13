@@ -8,6 +8,7 @@ import json
 from collections import defaultdict
 import importlib
 import dbm
+import re
 
 # note: to check which DBM backend is being used:
 #   >>> doit dumpdb
@@ -39,6 +40,38 @@ def get_file_md5(path):
                 break
             md5.update(data)
     return md5.hexdigest()
+
+
+_ENV_SENSITIVE_WORDS = {
+    'ACCESSKEY', 'APIKEY', 'AUTH', 'AUTHORIZATION', 'AUTHTOKEN',
+    'BEARER', 'COOKIE', 'CREDENTIAL', 'CREDENTIALS', 'KEY', 'PASS',
+    'PASSWORD', 'PASSPHRASE', 'PASSWD', 'PRIVATE', 'PRIVATEKEY',
+    'SECRET', 'SECRETKEY', 'SIGNATURE', 'TOKEN',
+}
+_ENV_SENSITIVE_NAMES = {
+    'APIKEY', 'ACCESSKEY', 'PRIVATEKEY', 'SECRETKEY',
+}
+
+
+def is_sensitive_env_name(name):
+    """return True when an environment variable name looks like a secret."""
+    upper = name.upper()
+    if upper in _ENV_SENSITIVE_NAMES:
+        return True
+    parts = [part for part in re.split(r'[^A-Z0-9]+', upper) if part]
+    return any(part in _ENV_SENSITIVE_WORDS for part in parts)
+
+
+def env_value_fingerprint(name, present, value):
+    """one-way fingerprint used to compare environment values.
+
+    The value itself is never part of the persisted metadata. Including the
+    variable name avoids comparing unrelated values that happen to be equal.
+    """
+    payload = json.dumps(
+        ['doit-env-v1', name, bool(present), value if present else None],
+        ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+    return 'sha256:' + hashlib.sha256(payload.encode('utf-8')).hexdigest()
 
 
 class JSONCodec():
@@ -537,6 +570,13 @@ class Dependency:
             else:
                 self._set(task.name, "result:", get_md5(task.result))
 
+        # environment values selected for the up-to-date check
+        if getattr(task, 'has_env_config', False):
+            self._set(task.name, 'env:', task.env_metadata(reuse=True))
+        elif self._get(task.name, 'env:') is not None:
+            # env declaration was removed: forget stale environment data
+            self._set(task.name, 'env:', None)
+
         # file-dep
         self._set(task.name, 'checker:', self.checker.__class__.__name__)
         for dep in task.file_dep:
@@ -652,8 +692,13 @@ class Dependency:
         if not get_log and result.status == 'run':
             return result
 
+        # selected environment variables count as dependencies for tasks
+        # that declare them; tasks without env keep the original behavior.
+        env_names = task.env_dependency_names(refresh=True) if getattr(
+            task, 'has_env_config', False) else []
+
         # no dependencies means it is never up to date.
-        if not (task.file_dep or uptodate_result_list):
+        if not (task.file_dep or uptodate_result_list or env_names):
             if result.set_reason('has_no_dependencies', True):
                 return result
 
@@ -664,6 +709,24 @@ class Dependency:
                 task.dep_changed = list(task.file_dep)
                 if result.add_reason('missing_target', targ):
                     return result
+
+        # check environment variables selected for up-to-date
+        if getattr(task, 'has_env_config', False):
+            previous_env = self._get(task.name, 'env:')
+            current_env = task.env_metadata()
+            if previous_env != current_env:
+                # an empty declaration on either side is equivalent to no
+                # environment information, avoid a spurious rebuild.
+                if previous_env or current_env:
+                    previous = previous_env or {}
+                    current = current_env or {}
+                    changed_names = sorted(
+                        name for name in set(previous) | set(current)
+                        if (previous.get(name) or {}).get('fingerprint')
+                        != (current.get(name) or {}).get('fingerprint'))
+                    if changed_names and result.add_reason(
+                            'env_changed', changed_names):
+                        return result
 
         # check for modified file_dep checker
         previous = self._get(task.name, 'checker:')

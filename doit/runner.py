@@ -33,6 +33,8 @@ class Runner():
       finish()
 
     """
+    env_isolation = False
+
     def __init__(self, dep_manager, reporter, continue_=False,
                  always_execute=False, stream=None):
         """
@@ -130,6 +132,17 @@ class Runner():
                 self._handle_task_error(node, UnmetDependency(bad_str))
                 return False
 
+            # fix the per-task environment before checking status. The
+            # same snapshot is sent to the worker and used by its actions.
+            if getattr(task, 'has_env_config', False):
+                try:
+                    task.begin_env()
+                except Exception as exception:
+                    msg = ("ERROR: Task '{}' preparing environment: {}"
+                           .format(task.name, exception))
+                    self._handle_task_error(node, DependencyError(msg))
+                    return False
+
             # check if task is up-to-date
             res = self.dep_manager.get_status(task, tasks_dict)
             if res.status == 'error':
@@ -169,15 +182,18 @@ class Runner():
         return True
 
 
-    def execute_task(self, task):
+    def execute_task(self, task, env_isolation=None):
         """execute task's actions"""
         # register cleanup/teardown
         if task.teardown:
             self.teardown_list.append(task)
 
+        if env_isolation is None:
+            env_isolation = self.env_isolation
+
         # finally execute it!
         self.reporter.execute_task(task)
-        return task.execute(self.stream)
+        return task.execute(self.stream, env_isolation=env_isolation)
 
 
     def process_task_result(self, node, base_fail):
@@ -229,7 +245,8 @@ class Runner():
         """run teardown from all tasks"""
         for task in reversed(self.teardown_list):
             self.reporter.teardown_task(task)
-            result = task.execute_teardown(self.stream)
+            result = task.execute_teardown(
+                self.stream, env_isolation=self.env_isolation)
             if result:
                 msg = "ERROR: task '%s' teardown action" % task.name
                 error = SetupError(msg, result)
@@ -252,6 +269,9 @@ class Runner():
         @ivar task_dispatcher (TaskDispatcher)
         """
         try:
+            # a task always uses one fixed environment snapshot per run.
+            for task in task_dispatcher.tasks.values():
+                task.reset_env_snapshot()
             if hasattr(self.reporter, 'initialize'):
                 self.reporter.initialize(task_dispatcher.tasks,
                                          task_dispatcher.selected_tasks)
@@ -517,6 +537,9 @@ class MRunner(Runner):
         self.result_q = result_q
         if self.Child == Process:
             self.reporter = MReporter(self, reporter_class)
+            # this process executes one task at a time and is isolated from
+            # the parent, so PythonAction can safely apply a task env.
+            self.env_isolation = True
         try:
             while True:
                 job = job_q.get()
@@ -563,6 +586,7 @@ class MRunner(Runner):
 class MThreadRunner(MRunner):
     """Parallel runner using threads"""
     Queue = staticmethod(queue.Queue)
+    env_isolation = False
     class DaemonThread(Thread):
         """daemon thread to make sure process is terminated if there is
         an uncatch exception and threads are not correctly joined.

@@ -177,6 +177,68 @@ check :ref:`tools.LongRunning<tools.LongRunning>` as an example.
 
 
 
+.. _task-environment:
+
+environment variables
+---------------------
+
+A task can declare a private environment with the ``env`` attribute. The
+declaration is merged over the environment inherited from the process running
+``doit``. Values override inherited variables and ``None`` explicitly removes
+a variable::
+
+    def task_etl():
+        return {
+            'actions': ['python etl.py'],
+            'env': {
+                'TZ': 'UTC',                  # override
+                'LC_ALL': 'C',                # override
+                'INHERITED_VAR': os.environ.get('INHERITED_VAR'),
+                'OLD_VARIABLE': None,         # explicit deletion
+            },
+        }
+
+The environment is resolved once when the task starts and that fixed snapshot
+is used by every action of the task. The parent process environment is never
+modified.
+
+By default all variables declared in ``env`` participate in the up-to-date
+check and count as task dependencies. Use ``env_uptodate`` to select a subset
+(names may also refer to inherited variables that are not changed by the
+task)::
+
+    def task_etl():
+        return {
+            'actions': ['python etl.py'],
+            'env': {'TZ': 'UTC', 'LC_ALL': 'C'},
+            'env_uptodate': ['TZ'],
+        }
+
+``CmdAction`` always starts a new process and receives a copy of the task
+environment, so this is safe in serial, thread, and process runners.
+``PythonAction`` cannot safely replace ``os.environ`` in a shared process. It
+is therefore accepted only when the task runs in an isolated process (the
+default parallel process runner). In serial or thread execution it is refused
+with a clear error instead of temporarily mutating the process-wide
+environment.
+
+Environment values that look like secrets (for example names containing
+``PASSWORD``, ``SECRET``, ``TOKEN``, or ``KEY``) are treated as sensitive.
+Only the variable name and a one-way fingerprint are persisted for those
+variables. Use ``env_sensitive`` to mark additional names explicitly::
+
+    'env_sensitive': ['MY_PRIVATE_SETTING']
+
+Tasks without an ``env`` declaration keep the original behavior; no
+environment information is added to their dependency database entries.
+
+.. note::
+
+  A Python action that needs a task environment should use the process-based
+  parallel runner, or use ``CmdAction`` instead.
+
+
+
 task name
 ------------
 

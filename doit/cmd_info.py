@@ -106,6 +106,7 @@ class Info(DoitCmdBase):
             'missing_file_dep': 'The following file dependencies are missing:',
             'removed_file_dep': 'The following file dependencies were removed:',
             'added_file_dep': 'The following file dependencies were added:',
+            'env_changed': 'The following environment variables changed:',
         }
         for reason, sentence in sentences.items():
             entries = reasons.get(reason)

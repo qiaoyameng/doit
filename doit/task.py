@@ -12,6 +12,7 @@ from .cmdparse import CmdOption, TaskParse
 from .exceptions import BaseFail, InvalidTask
 from .action import create_action, PythonAction
 from .dependency import UptodateCalculator
+from .dependency import is_sensitive_env_name, env_value_fingerprint
 
 
 def first_line(doc):
@@ -132,6 +133,15 @@ class Task:
     @ivar getargs: (dict) values from other tasks
     @ivar doc: (string) task documentation
     @ivar meta: (dict) extra info from user/plugin not directly used by doit
+    @ivar env: (dict/callable) per-task environment overrides.
+               A value of None removes an inherited variable.
+    @ivar env_uptodate: (list - string) environment variables whose values
+                        are part of the up-to-date check. If None all
+                        variables declared in `env` are used.
+    @ivar env_sensitive: (list - string) variables that must never have their
+                         value stored. Values matching common secret names
+                         are also treated as sensitive.
+    @ivar env_inherit: (bool) start from the parent process environment.
 
     @ivar options: (dict) calculated params values (from getargs and taskopt)
     @ivar taskopt: (cmdparse.CmdParse)
@@ -164,7 +174,14 @@ class Task:
                   'getargs': ((dict,), ()),
                   'title': ((Callable,), (None,)),
                   'watch': ((list, tuple), ()),
-                  'meta': ((dict,), (None,))
+                  'meta': ((dict,), (None,)),
+                  'env': ((dict, list, tuple, Callable), (None,)),
+                  'env_uptodate': ((list, tuple, set), (None,)),
+                  'env_dep': ((list, tuple, set), (None,)),
+                  'env_deps': ((list, tuple, set), (None,)),
+                  'env_sensitive': ((list, tuple, set), (None,)),
+                  'sensitive_env': ((list, tuple, set), (None,)),
+                  'env_inherit': ((), (None, True, False)),
                   }
 
 
@@ -174,7 +191,9 @@ class Task:
                  subtask_of=None, has_subtask=False,
                  doc=None, params=(), pos_arg=None,
                  verbosity=None, io=None, title=None, getargs=None,
-                 watch=(), meta=None, loader=None):
+                 watch=(), meta=None, loader=None, env=None,
+                 env_uptodate=None, env_sensitive=None, env_inherit=True,
+                 env_dep=None, env_deps=None, sensitive_env=None):
         """sanity checks and initialization
 
         @param params: (list of dict for parameters) see cmdparse.CmdOption
@@ -200,6 +219,24 @@ class Task:
         self.check_attr(name, 'title', title, self.valid_attr['title'])
         self.check_attr(name, 'watch', watch, self.valid_attr['watch'])
         self.check_attr(name, 'meta', meta, self.valid_attr['meta'])
+        self.check_attr(name, 'env', env, self.valid_attr['env'])
+        if env_uptodate is None:
+            env_uptodate = env_dep if env_dep is not None else env_deps
+        if env_sensitive is None:
+            env_sensitive = sensitive_env
+
+        self.check_attr(name, 'env_uptodate', env_uptodate,
+                        self.valid_attr['env_uptodate'])
+        self.check_attr(name, 'env_dep', env_dep,
+                        self.valid_attr['env_dep'])
+        self.check_attr(name, 'env_deps', env_deps,
+                        self.valid_attr['env_deps'])
+        self.check_attr(name, 'env_sensitive', env_sensitive,
+                        self.valid_attr['env_sensitive'])
+        self.check_attr(name, 'sensitive_env', sensitive_env,
+                        self.valid_attr['sensitive_env'])
+        self.check_attr(name, 'env_inherit', env_inherit,
+                        self.valid_attr['env_inherit'])
 
         if '=' in name:
             msg = "Task '{}': name must not use the char '=' (equal sign)."
@@ -257,6 +294,13 @@ class Task:
         self.doc = self._init_doc(doc)
         self.watch = watch
         self.meta = meta
+        self.env = self._init_env(env)
+        self.env_uptodate = self._init_env_names(env_uptodate,
+                                                 'env_uptodate')
+        self.env_sensitive = self._init_env_names(env_sensitive,
+                                                  'env_sensitive')
+        self.env_inherit = True if env_inherit is None else env_inherit
+        self.reset_env_snapshot()
         # just indicate if actions were executed at all
         self.executed = False
 
@@ -279,6 +323,43 @@ class Task:
         self.calc_dep = set()
         if calc_dep:
             self._expand_calc_dep(calc_dep)
+
+
+    def _init_env(self, env):
+        """validate/normalize the per-task environment declaration."""
+        if env is None or callable(env):
+            return env
+        if isinstance(env, (list, tuple)):
+            return self._init_env_names(env, 'env')
+        normalized = {}
+        for name, value in env.items():
+            if not isinstance(name, str) or not name or '=' in name:
+                msg = ("Task '%s': invalid environment variable name %r."
+                       % (self.name, name))
+                raise InvalidTask(msg)
+            if value is not None and not isinstance(
+                    value, (str, int, float, bool, PurePath)):
+                msg = ("Task '%s': environment variable '%s' must be a "
+                       "string, number, Path or None. Got %r (%s)."
+                       % (self.name, name, value, type(value)))
+                raise InvalidTask(msg)
+            normalized[name] = None if value is None else str(value)
+        return normalized
+
+
+    def _init_env_names(self, names, attr):
+        """validate a list of environment variable names."""
+        if names is None:
+            return None
+        result = []
+        for name in names:
+            if not isinstance(name, str) or not name:
+                msg = ("Task '%s': '%s' must contain environment variable "
+                       "names, got %r." % (self.name, attr, name))
+                raise InvalidTask(msg)
+            if name not in result:
+                result.append(name)
+        return result
 
 
     def _init_targets(self, items):
@@ -454,6 +535,145 @@ class Task:
         return self._action_instances
 
 
+    @property
+    def has_env_config(self):
+        """return True when the task declares environment behavior."""
+        return (bool(self.env) or callable(self.env)
+                or self.env_uptodate is not None
+                or self.env_sensitive is not None
+                or self.env_inherit is False)
+
+
+    @property
+    def env_requires_injection(self):
+        """True when actions need an environment different from inherited."""
+        return (self.env_inherit is False or bool(self.env)
+                or callable(self.env))
+
+
+    def _resolve_env_declaration(self):
+        """evaluate an env declaration once per task execution snapshot."""
+        declaration = self.env
+        if callable(declaration):
+            declaration = declaration()
+        if declaration is None:
+            return {}
+        if isinstance(declaration, (list, tuple)):
+            # listing names means: inherit/select their current values.
+            return {name: os.environ.get(name) for name in declaration}
+        if not isinstance(declaration, dict):
+            msg = ("Task '%s': 'env' must be a dict, list of inherited "
+                   "names, or a callable returning a dict. Got %r."
+                   % (self.name, declaration))
+            raise InvalidTask(msg)
+        return declaration
+
+
+    def reset_env_snapshot(self):
+        """forget the fixed environment snapshot for a new task run."""
+        self._env_snapshot = None
+        self._env_snapshot_used = False
+        self._env_snapshot_locked = False
+        self._env_selected = []
+        self._env_sensitive = []
+        self._env_declaration_resolved = None
+
+
+    def _capture_env(self):
+        """build a fixed environment snapshot for this task run."""
+        declaration = self._resolve_env_declaration()
+
+        if self.env_inherit is False:
+            environment = {}
+        else:
+            environment = dict(os.environ)
+
+        for name, value in declaration.items():
+            if value is None:
+                environment.pop(name, None)
+            else:
+                environment[name] = str(value)
+
+        if self.env_uptodate is None:
+            selected = list(declaration)
+        else:
+            selected = list(self.env_uptodate)
+
+        explicit_sensitive = set(self.env_sensitive or ())
+        self._env_snapshot = environment
+        self._env_snapshot_used = False
+        self._env_snapshot_locked = False
+        self._env_declaration_resolved = declaration
+        self._env_selected = selected
+        self._env_sensitive = [
+            name for name in selected
+            if name in explicit_sensitive or is_sensitive_env_name(name)
+        ]
+        return environment
+
+
+    def begin_env(self):
+        """start a task and fix the snapshot used until the task finishes."""
+        if not self.has_env_config:
+            return None
+        self._capture_env()
+        self._env_snapshot_locked = True
+        return self._env_snapshot
+
+
+    def get_env_snapshot(self, refresh=False, reuse=False):
+        """return the fixed environment snapshot.
+
+        A snapshot locked by the runner is never refreshed between selecting
+        and executing a task. ``reuse`` is used when saving task results.
+        """
+        if not self.has_env_config:
+            return None
+        needs_capture = (
+            self._env_snapshot is None
+            or (refresh and not self._env_snapshot_locked)
+            or (not reuse and self._env_snapshot_used)
+        )
+        if needs_capture:
+            self._capture_env()
+        return self._env_snapshot
+
+
+    def env_dependency_names(self, refresh=False):
+        """names that make an env-aware task have an up-to-date dependency."""
+        if not self.has_env_config:
+            return []
+        self.get_env_snapshot(refresh=refresh)
+        return list(self._env_selected)
+
+
+    def env_metadata(self, for_status=False, reuse=False):
+        """metadata persisted/compared for selected environment variables.
+
+        Sensitive values are represented only by a one-way fingerprint and
+        the variable name. Non-sensitive values are kept for diagnostics.
+        """
+        if not self.has_env_config:
+            return None
+
+        snapshot = self.get_env_snapshot(refresh=for_status, reuse=reuse)
+        metadata = {}
+        for name in self._env_selected:
+            present = name in snapshot
+            value = snapshot.get(name) if present else None
+            sensitive = name in self._env_sensitive
+            entry = {
+                'name': name,
+                'sensitive': sensitive,
+                'present': present,
+                'fingerprint': env_value_fingerprint(name, present, value),
+            }
+            if present and not sensitive:
+                entry['value'] = value
+            metadata[name] = entry
+        return metadata
+
+
     def save_extra_values(self):
         """run value_savers updating self.values"""
         for value_saver in self.value_savers:
@@ -462,39 +682,59 @@ class Task:
     def overwrite_verbosity(self, stream):
         self.verbosity = stream.effective_verbosity(self.verbosity)
 
-    def execute(self, stream):
+    def execute(self, stream, env_isolation=False):
         """Executes the task.
+        @param env_isolation: the action runs in a dedicated process where
+                              per-task ``env`` can be applied safely.
         @return failure: see CmdAction.execute
         """
         self.executed = True
         self.init_options()
+        self._env_isolated = bool(env_isolation)
+        if self.has_env_config and (
+                self._env_snapshot is None or self._env_snapshot_used):
+            self.begin_env()
         task_stdout, task_stderr = stream._get_out_err(self.verbosity)
-        for action in self.actions:
-            action_return = action.execute(task_stdout, task_stderr)
-            if isinstance(action_return, BaseFail):
-                return action_return
-            self.result = action.result
-            self.values.update(action.values)
+        try:
+            for action in self.actions:
+                action_return = action.execute(task_stdout, task_stderr)
+                if isinstance(action_return, BaseFail):
+                    return action_return
+                self.result = action.result
+                self.values.update(action.values)
+        finally:
+            self._env_snapshot_used = True
+            self._env_isolated = False
 
 
-    def execute_teardown(self, stream):
+    def execute_teardown(self, stream, env_isolation=False):
         """Executes task's teardown
         @return failure: see CmdAction.execute
         """
+        self._env_isolated = bool(env_isolation)
+        if self.has_env_config:
+            self.get_env_snapshot(reuse=True)
         task_stdout, task_stderr = stream._get_out_err(self.verbosity)
-        for action in self.teardown:
-            action_return = action.execute(task_stdout, task_stderr)
-            if isinstance(action_return, BaseFail):
-                return action_return
+        try:
+            for action in self.teardown:
+                action_return = action.execute(task_stdout, task_stderr)
+                if isinstance(action_return, BaseFail):
+                    return action_return
+        finally:
+            self._env_isolated = False
 
 
-    def clean(self, outstream, dryrun):
+    def clean(self, outstream, dryrun, env_isolation=False):
         """Execute task's clean
         @ivar outstream: 'write' output into this stream
         @ivar dryrun (bool): if True clean tasks are not executed
                              (just print out what would be executed)
         """
         self.init_options()
+        self._env_isolated = bool(env_isolation)
+        if self.has_env_config and (
+                self._env_snapshot is None or self._env_snapshot_used):
+            self.begin_env()
         # if clean is True remove all targets
         if self._remove_targets is True:
             clean_targets(self, dryrun)
@@ -548,6 +788,10 @@ class Task:
         mostly probably closures
         """
         to_pickle = self.__dict__.copy()
+        if callable(to_pickle['env']):
+            # avoid sending an unpicklable callable to a worker; its fixed
+            # snapshot/resolved declaration is already available.
+            to_pickle['env'] = self._env_declaration_resolved
         del to_pickle['_actions']
         del to_pickle['_action_instances']
         del to_pickle['clean_actions']

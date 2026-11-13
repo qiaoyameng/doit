@@ -320,10 +320,21 @@ check_file_uptodate
 `doit` provides different options to check if dependency files are up to date
 (see :ref:`file-dep`).  Use the option ``--check_file_uptodate`` to choose:
 
- * `md5`: use the md5sum.
- * `timestamp`: use the timestamp.
+ * `sha256` (default): use a SHA-256 content digest.
+ * `sha256-strict` (alias `strict-content`): use SHA-256 and always compare
+   content, even when size and modification time are unchanged.
+ * `md5`: use the legacy md5sum and its legacy state format.
+ * `timestamp`: use only the timestamp.
+
+The ``--strict-content`` flag can also be used with a digest checker to enable
+the same content-always behavior.
 
 .. note::
+
+   `sha256` and `md5` keep a fast-path that trusts an unchanged `mtime`.  This
+   is efficient, but it can miss a file that was copied from another file with
+   the original timestamp preserved.  Use ``sha256-strict`` (or
+   ``--strict-content``) when that case matters.
 
    The `timestamp` checker considers a file is not up-to-date if there is
    **any** change in the the modified time (`mtime`), it does not matter if
@@ -335,7 +346,35 @@ all commands using `DOIT_CONFIG`.
 
 .. code-block:: console
 
-    DOIT_CONFIG = {'check_file_uptodate': 'timestamp'}
+    DOIT_CONFIG = {'check_file_uptodate': 'sha256-strict'}
+
+
+.. _file_dep_state_migration:
+
+File dependency state versioning and migration
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+SHA-256 dependency states are self-describing and record both the algorithm
+and the state-format version (currently version ``2``).  Other algorithms and
+older formats are never silently interpreted as SHA-256 states.
+
+When a database is opened with a different checker/version than the one that
+created its records:
+
+ * every task with a ``file_dep`` whose checker record changed is considered
+   out-of-date and runs again;
+ * old ``md5``/``timestamp`` records encountered by the SHA-256 checker are
+   treated as out-of-date, so no stale digest is reused;
+ * new success evidence is written only after the task action succeeds.  A
+   failed task does not publish a new SHA-256 state;
+ * records already using the same checker and state version remain valid and
+   those tasks stay up-to-date.
+
+Switching back to ``md5`` or ``timestamp`` also invalidates the SHA-256
+records and reruns tasks that have file dependencies.  Tasks without
+``file_dep`` are unaffected by this migration (they always run unless an
+``uptodate`` rule says otherwise).  ``doit reset-dep`` can recompute and store
+the new checker state for existing files without executing task actions.
 
 
 

@@ -7,7 +7,7 @@ import platform
 from unittest.mock import Mock, patch
 
 from doit.exceptions import BaseFail, InvalidTask
-from doit.dependency import DbmDB, Dependency
+from doit.dependency import DbmDB, Dependency, SHA256StrictChecker
 from doit.reporter import ConsoleReporter
 from doit.task import Task, DelayedLoader
 from doit.control import TaskDispatcher, ExecNode
@@ -546,6 +546,54 @@ class RunnerRunTasksBase:
         disp = TaskDispatcher({'t1': t1}, [], ['t1'])
         self.assertRaises(SystemExit, my_runner.run_tasks, disp)
         my_runner.finish()
+
+
+class TestFailedTaskEvidence(DepManagerMixin, unittest.TestCase):
+    """A failed action must not publish new dependency success evidence."""
+
+    def test_failed_task_does_not_save_dependency_state(self):
+        dep_path = os.path.join(self._dep_tmpdir, 'dep.txt')
+        with open(dep_path, 'wb') as out:
+            out.write(b'payload')
+
+        t1 = Task("failed-task", [(_fail,)], file_dep=[dep_path])
+        my_runner = runner.Runner(self.dep_manager, FakeReporter())
+        my_runner.run_tasks(TaskDispatcher({'failed-task': t1}, [],
+                                           ['failed-task']))
+        self.assertEqual(runner.FAILURE, my_runner.final_result)
+        self.assertIsNone(self.dep_manager._get(t1.name, 'deps:'))
+        self.assertIsNone(self.dep_manager._get(t1.name, 'checker:'))
+        self.assertIsNone(self.dep_manager._get(t1.name, dep_path))
+
+    def test_failed_task_does_not_replace_previous_success_state(self):
+        dep_path = os.path.join(self._dep_tmpdir, 'dep.txt')
+        with open(dep_path, 'wb') as out:
+            out.write(b'aaaa')
+        stat_before = os.stat(dep_path)
+        self.dep_manager.checker = SHA256StrictChecker()
+
+        t1 = Task("retry-task", [(my_print, ['ok'])], file_dep=[dep_path])
+        my_runner = runner.Runner(self.dep_manager, FakeReporter())
+        my_runner.run_tasks(TaskDispatcher({'retry-task': t1}, [],
+                                           ['retry-task']))
+        self.assertEqual(runner.SUCCESS, my_runner.final_result)
+        saved = self.dep_manager._get(t1.name, dep_path)
+        self.assertIsNotNone(saved)
+
+        # Content changes while size and mtime stay identical.
+        with open(dep_path, 'wb') as out:
+            out.write(b'bbbb')
+        os.utime(dep_path, ns=(stat_before.st_atime_ns,
+                               stat_before.st_mtime_ns))
+
+        t2 = Task("retry-task", [(_fail,)], file_dep=[dep_path])
+        my_runner = runner.Runner(self.dep_manager, FakeReporter())
+        my_runner.run_tasks(TaskDispatcher({'retry-task': t2}, [],
+                                           ['retry-task']))
+        self.assertEqual(runner.FAILURE, my_runner.final_result)
+        # A failed task never publishes new success evidence. doit also
+        # invalidates the previous success record in this case.
+        self.assertIsNone(self.dep_manager._get(t2.name, dep_path))
 
 
 class TestRunnerRunTasks_Runner(RunnerRunTasksBase, DepManagerMixin,

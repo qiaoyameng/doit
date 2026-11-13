@@ -195,7 +195,7 @@ rules for up-to-date checks on files
 file_dep
 ^^^^^^^^
 
-``doit`` uses the *md5* of ``file_dep`` to determine if a dependency has changed.
+``doit`` uses a SHA-256 digest of ``file_dep`` to determine if a dependency has changed.
 
 
 .. code-block:: console

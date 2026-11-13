@@ -11,7 +11,7 @@ class ResetDep(DoitCmdBase):
     cmd_options = ()
     doc_description = """
 This command allows to recompute the information on file dependencies
-(timestamp, md5sum, ... depending on the ``check_file_uptodate`` setting), and
+(sha256 digest, timestamp, ... depending on the ``check_file_uptodate`` setting), and
 save this in the database, without executing the actions.
 
 The command run on all tasks by default, but it is possible to specify a list

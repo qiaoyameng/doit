@@ -7,6 +7,7 @@ from doit import version
 from doit.cmdparse import CmdParseError, CmdParse
 from doit.exceptions import InvalidCommand, InvalidDodoFile
 from doit.dependency import FileChangedChecker, JSONCodec
+from doit.dependency import SHA256Checker, SHA256StrictChecker
 from doit.task import Task
 from doit.loader import task_params
 from doit.cmd_base import version_tuple, Command, DoitCmdBase
@@ -287,6 +288,22 @@ class TestDoitCmdBase(DepfileNameMixin, unittest.TestCase):
         params['dep_file'] = self.depfile_name
         mycmd.execute(params, args)
         self.assertIsInstance(mycmd.dep_manager.checker, MyChecker)
+
+    def test_default_checker_is_sha256(self):
+        mycmd = self.MyCmd(task_loader=ModuleTaskLoader({}))
+        mycmd.parse_execute(['--db-file', self.depfile_name, '--mine', 'min'])
+        self.assertIsInstance(mycmd.dep_manager.checker, SHA256Checker)
+        self.assertEqual('sha256:2',
+                         mycmd.dep_manager.checker.get_checker_id())
+
+    def test_strict_content_option(self):
+        mycmd = self.MyCmd(task_loader=ModuleTaskLoader({}))
+        mycmd.parse_execute(['--db-file', self.depfile_name,
+                             '--strict-content', '--mine', 'min'])
+        self.assertIsInstance(mycmd.dep_manager.checker,
+                              SHA256StrictChecker)
+        self.assertEqual('sha256-strict:2',
+                         mycmd.dep_manager.checker.get_checker_id())
 
     def testCustomCodec(self):
         class MyCodec(JSONCodec):

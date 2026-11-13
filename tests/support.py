@@ -10,7 +10,7 @@ import shutil
 import itertools
 from dbm import whichdb
 
-from doit.dependency import Dependency, MD5Checker
+from doit.dependency import Dependency, SHA256Checker
 from doit.dependency import DbmDB, JsonDB, SqliteDB
 from doit.task import Task
 from doit.cmd_base import get_loader
@@ -86,7 +86,7 @@ def CmdFactory(cls, outstream=None, task_loader=None, dep_file=None,
         cmd.outstream = outstream
     if backend:
         dep_class = backend_map[backend]
-        cmd.dep_manager = Dependency(dep_class, dep_file, MD5Checker,
+        cmd.dep_manager = Dependency(dep_class, dep_file, SHA256Checker,
                                      module_name=backend)
     elif dep_manager:
         cmd.dep_manager = dep_manager

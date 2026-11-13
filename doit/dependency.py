@@ -41,6 +41,37 @@ def get_file_md5(path):
     return md5.hexdigest()
 
 
+def get_file_digest(path, algorithm):
+    """Calculate a hex digest from file content.
+
+    @param path: (string) file path
+    @param algorithm: (string) hashlib algorithm name
+    @return: (string) hex digest
+    """
+    hasher = hashlib.new(algorithm)
+    with open(path, 'rb') as file_data:
+        block_size = 128 * hasher.block_size
+        while True:
+            data = file_data.read(block_size)
+            if not data:
+                break
+            hasher.update(data)
+    return hasher.hexdigest()
+
+
+def get_file_sha256(path):
+    """Calculate the sha256 digest from file content.
+
+    @param path: (string) file path
+    @return: (string) sha256
+    """
+    return get_file_digest(path, 'sha256')
+
+
+# common short spelling
+get_sha256 = get_file_sha256
+
+
 class JSONCodec():
     """default implmentation for codec used to save individual task's data"""
     def __init__(self):
@@ -350,12 +381,21 @@ class FileChangedChecker:
     """Base checker for dependencies, must be inherited."""
 
     CheckerError = os.error
+    checker_id = None
 
     def exists(self, file_path):
         return os.path.exists(file_path)
 
     def info(self, file_path):
         return os.stat(file_path)
+
+    def get_checker_id(self):
+        """Return the identifier saved in the dependency DB.
+
+        Sub-classes may override this to include state-format/algorithm
+        information. The default keeps the historical class-name value.
+        """
+        return self.checker_id or self.__class__.__name__
 
     def check_modified(self, file_path, file_stat, state):
         """Check if file in file_path is modified from previous "state".
@@ -383,19 +423,23 @@ class FileChangedChecker:
 
 
 class MD5Checker(FileChangedChecker):
-    """MD5 checker, uses the md5sum.
-
-    This is the default checker used by doit.
+    """Legacy MD5 checker, uses the md5sum.
 
     As an optimization the check uses (timestamp, file-size, md5).
     If the timestamp is the same it considers that the file has the same
     content. If file size is different its content certainly is modified.
     Finally the md5 is used for a different timestamp with the same size.
+
+    This checker keeps the historical on-disk state format. Use
+    :class:`SHA256Checker` for new databases.
     """
 
     def check_modified(self, file_path, file_stat, state):
         """Check if file in file_path is modified from previous "state".
         """
+        if not isinstance(state, (tuple, list)) or len(state) != 3:
+            # Never try to unpack a state written by a newer checker/version.
+            return True
         timestamp, size, file_md5 = state
 
         # 1 - if timestamp is not modified file is the same
@@ -414,7 +458,9 @@ class MD5Checker(FileChangedChecker):
         timestamp = os.path.getmtime(dep)
         # time optimization. if dep is already saved with current
         # timestamp skip calculating md5
-        if current_state and current_state[0] == timestamp:
+        if (isinstance(current_state, (tuple, list))
+                and len(current_state) == 3
+                and current_state[0] == timestamp):
             return
         size = os.path.getsize(dep)
         md5 = get_file_md5(dep)
@@ -432,8 +478,183 @@ class TimestampChecker(FileChangedChecker):
         return os.path.getmtime(dep)
 
 
+class DigestChecker(FileChangedChecker):
+    """Base class for content-digest checkers with versioned state.
+
+    The saved state is a self-describing mapping::
+
+        {'version': 2, 'algorithm': 'sha256', 'timestamp': ...,
+         'mtime_ns': ..., 'size': ..., 'digest': ...}
+
+    Old MD5/timestamp records are intentionally not interpreted by this
+    class. They are reported as modified so the task runs again and a new
+    state can be written after the task succeeds.
+
+    Digests are cached for the lifetime of the checker (one doit execution
+    round). Cache entries are validated against the complete stat identity
+    (device, inode, size, mtime_ns and ctime_ns), so replacing a file while
+    preserving its mtime cannot reuse a stale digest.
+    """
+
+    algorithm = None
+    name = None
+    version = 2
+    state_format_version = 2
+    strict_content = False
+    checker_id = None
+
+    def __init__(self, strict_content=None, cache=None):
+        if strict_content is not None:
+            self.strict_content = bool(strict_content)
+        self._cache = {} if cache is None else cache
+
+    def get_checker_id(self):
+        if self.strict_content:
+            return '{}-strict:{}'.format(
+                self.algorithm, self.state_format_version)
+        return self.checker_id or '{}:{}'.format(
+            self.algorithm, self.state_format_version)
+
+    def reset_cache(self):
+        """Drop memoized digests (start of a new execution round)."""
+        self._cache.clear()
+
+    @staticmethod
+    def _mtime_ns(file_stat):
+        return getattr(file_stat, 'st_mtime_ns',
+                       int(file_stat.st_mtime * 1000000000))
+
+    def _stat_key(self, file_stat):
+        ctime_ns = getattr(file_stat, 'st_ctime_ns', None)
+        if ctime_ns is None:
+            ctime_ns = int(getattr(file_stat, 'st_ctime', 0) * 1000000000)
+        return (
+            getattr(file_stat, 'st_dev', None),
+            getattr(file_stat, 'st_ino', None),
+            file_stat.st_size,
+            self._mtime_ns(file_stat),
+            ctime_ns,
+        )
+
+    def _digest_info(self, dep, file_stat):
+        """Return cached or freshly computed digest information.
+
+        The returned mapping contains the digest and the stat values of the
+        file snapshot that was actually hashed.
+        """
+        cache_key = os.path.abspath(dep)
+        entry = self._cache.get(cache_key)
+        stat = file_stat
+        if (entry and entry['algorithm'] == self.algorithm
+                and entry['stat_key'] == self._stat_key(stat)):
+            return entry
+
+        # If the file changes while it is being read, hash the new snapshot.
+        for _attempt in range(4):
+            digest = get_file_digest(dep, self.algorithm)
+            after = os.stat(dep)
+            if self._stat_key(after) == self._stat_key(stat):
+                stat = after
+                break
+            stat = after
+        else:
+            digest = get_file_digest(dep, self.algorithm)
+            stat = os.stat(dep)
+
+        entry = {
+            'algorithm': self.algorithm,
+            'digest': digest,
+            'stat_key': self._stat_key(stat),
+            'timestamp': stat.st_mtime,
+            'mtime_ns': self._mtime_ns(stat),
+            'size': stat.st_size,
+        }
+        self._cache[cache_key] = entry
+        return entry
+
+    def _valid_state(self, state):
+        return (
+            isinstance(state, dict)
+            and state.get('version') == self.state_format_version
+            and state.get('algorithm') == self.algorithm
+            and isinstance(state.get('digest'), str)
+            and isinstance(state.get('mtime_ns'), int)
+            and isinstance(state.get('size'), int)
+        )
+
+    def _make_state(self, entry):
+        return {
+            'version': self.state_format_version,
+            'algorithm': self.algorithm,
+            'timestamp': entry['timestamp'],
+            'mtime_ns': entry['mtime_ns'],
+            'size': entry['size'],
+            'digest': entry['digest'],
+        }
+
+    def check_modified(self, file_path, file_stat, state):
+        if not self._valid_state(state):
+            # Legacy tuple/list states (md5/timestamp) and states from other
+            # algorithms must never be silently interpreted as this one.
+            return True
+
+        if not self.strict_content:
+            # Normal mode keeps the historical timestamp fast-path.
+            if self._mtime_ns(file_stat) == state['mtime_ns']:
+                return False
+            if file_stat.st_size != state['size']:
+                return True
+
+        entry = self._digest_info(file_path, file_stat)
+        return entry['digest'] != state['digest']
+
+    def get_state(self, dep, current_state):
+        file_stat = os.stat(dep)
+
+        if (not self.strict_content and self._valid_state(current_state)
+                and current_state['mtime_ns'] == self._mtime_ns(file_stat)):
+            # Same algorithm/format and timestamp: retain the existing state.
+            return None
+
+        entry = self._digest_info(dep, file_stat)
+        return self._make_state(entry)
+
+
+class SHA256Checker(DigestChecker):
+    """SHA-256 digest checker (default for newly created databases).
+
+    By default it keeps the historical mtime fast-path. Set
+    ``strict_content=True`` (or use :class:`SHA256StrictChecker`) to compare
+    file contents every round, even when mtime and size are unchanged.
+    """
+
+    algorithm = 'sha256'
+    name = 'sha256'
+    version = 2
+    state_format_version = 2
+    checker_id = 'sha256:2'
+
+
+class SHA256StrictChecker(SHA256Checker):
+    """SHA-256 checker that always verifies content (strict-content mode)."""
+
+    strict_content = True
+    checker_id = 'sha256-strict:2'
+
+
+# Backwards/forwards friendly spellings.
+Sha256Checker = SHA256Checker
+Sha256DigestChecker = SHA256Checker
+Sha256StrictChecker = SHA256StrictChecker
+StrictContentChecker = SHA256StrictChecker
+
+
 # name of checkers class available
-CHECKERS = {'md5': MD5Checker,
+CHECKERS = {'sha256': SHA256Checker,
+            'sha256-strict': SHA256StrictChecker,
+            'sha256_strict': SHA256StrictChecker,
+            'strict-content': SHA256StrictChecker,
+            'md5': MD5Checker,
             'timestamp': TimestampChecker}
 
 
@@ -498,10 +719,14 @@ class Dependency:
     :ivar string name: filepath of the DB file
     :ivar bool _closed: DB was flushed to file
     """
-    def __init__(self, db_class, backend_name, checker_cls=MD5Checker,
+    def __init__(self, db_class, backend_name, checker_cls=SHA256Checker,
                  codec_cls=JSONCodec, module_name=None):
         self._closed = False
-        self.checker = checker_cls()
+        if isinstance(checker_cls, type):
+            self.checker = checker_cls()
+        else:
+            # allow an already configured checker instance
+            self.checker = checker_cls
         self.db_class = db_class
         self.backend = db_class(backend_name, codec=codec_cls(), module_name=module_name)
         self._set = self.backend.set
@@ -523,8 +748,18 @@ class Dependency:
     def save_success(self, task, result_hash=None):
         """save info after a task is successfully executed
 
+        This is called only after the task action succeeded. Dependency
+        states are computed before any of the task's success evidence is
+        written, so a read error cannot leave a partially updated record.
+
         :param str result_hash: explicitly set result_hash
         """
+        # compute dependency states first (may raise if a dep disappeared)
+        dep_states = []
+        for dep in task.file_dep:
+            state = self.checker.get_state(dep, self._get(task.name, dep))
+            dep_states.append((dep, state))
+
         # save task values
         self._set(task.name, "_values_:", task.values)
 
@@ -538,9 +773,8 @@ class Dependency:
                 self._set(task.name, "result:", get_md5(task.result))
 
         # file-dep
-        self._set(task.name, 'checker:', self.checker.__class__.__name__)
-        for dep in task.file_dep:
-            state = self.checker.get_state(dep, self._get(task.name, dep))
+        self._set(task.name, 'checker:', self.checker.get_checker_id())
+        for dep, state in dep_states:
             if state is not None:
                 self._set(task.name, dep, state)
 
@@ -667,7 +901,7 @@ class Dependency:
 
         # check for modified file_dep checker
         previous = self._get(task.name, 'checker:')
-        checker_name = self.checker.__class__.__name__
+        checker_name = self.checker.get_checker_id()
         if previous and previous != checker_name:
             task.dep_changed = list(task.file_dep)
             # remove all saved values otherwise they might be re-used by

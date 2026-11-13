@@ -9,6 +9,7 @@ from . import version
 from .cmdparse import CmdOption, CmdParse
 from .exceptions import InvalidCommand, InvalidDodoFile
 from .dependency import CHECKERS, DbmDB, JsonDB, SqliteDB, Dependency, JSONCodec
+from .dependency import DigestChecker, SHA256Checker, SHA256StrictChecker
 from .action import CmdAction
 from .plugin import PluginDict
 from . import loader
@@ -235,12 +236,28 @@ opt_check_file_uptodate = {
     'short': '',
     'long': 'check_file_uptodate',
     'type': str,
-    'default': 'md5',
+    'default': 'sha256',
     'help': """\
 Choose how to check if files have been modified.
 Available options [default: %(default)s]:
-  'md5': use the md5sum
-  'timestamp': use the timestamp
+  'sha256': use a sha256 content digest (mtime fast-path)
+  'sha256-strict' / 'strict-content': always compare sha256 content
+  'md5': use the legacy md5sum state format
+  'timestamp': use only the timestamp
+"""
+}
+
+opt_strict_content = {
+    'section': 'doit core',
+    'name': 'strict_content',
+    'short': '',
+    'long': 'strict-content',
+    'type': bool,
+    'default': False,
+    'help': """\
+For digest checkers, always compare file contents even when mtime and
+size are unchanged. Needed when files may be copied with preserved
+timestamps. [default: %(default)s]
 """
 }
 
@@ -436,7 +453,7 @@ class DoitCmdBase(Command):
     _execute => method, argument names must be option names
     """
     base_options = (opt_depfile, opt_backend, opt_codec,
-                    opt_check_file_uptodate)
+                    opt_check_file_uptodate, opt_strict_content)
 
     def __init__(self, task_loader, cmds=None, **kwargs):
         super(DoitCmdBase, self).__init__(**kwargs)
@@ -541,6 +558,13 @@ class DoitCmdBase(Command):
         # create dep manager
         db_class = self._backends.get(params['backend'])
         checker_cls = self.get_checker_cls(params['check_file_uptodate'])
+        if (params.get('strict_content')
+                and isinstance(checker_cls, type)
+                and issubclass(checker_cls, DigestChecker)):
+            if checker_cls is SHA256Checker:
+                checker_cls = SHA256StrictChecker
+            else:
+                checker_cls = checker_cls(strict_content=True)
         codec_cls = self.get_codec_cls(params['codec_cls'])
         # note the command have the responsibility to call dep_manager.close()
 

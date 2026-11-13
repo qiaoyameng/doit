@@ -2,7 +2,7 @@ import unittest
 from io import StringIO
 
 from doit.cmd_resetdep import ResetDep
-from doit.dependency import TimestampChecker, get_md5, get_file_md5
+from doit.dependency import TimestampChecker, get_md5, get_file_sha256
 from doit.exceptions import InvalidCommand
 from doit.task import Task
 from tests.support import tasks_sample, CmdFactory, get_abspath
@@ -30,8 +30,10 @@ class TestCmdResetDep(DependencyFileMixin, DepManagerMixin, unittest.TestCase):
         self.assertEqual("processed t2\n", output.getvalue())
 
         dep = list(my_task.file_dep)[0]
-        timestamp, size, md5 = self.dep_manager._get(my_task.name, dep)
-        self.assertEqual(get_file_md5(get_abspath("data/dependency1")), md5)
+        state = self.dep_manager._get(my_task.name, dep)
+        self.assertEqual('sha256', state['algorithm'])
+        self.assertEqual(get_file_sha256(get_abspath("data/dependency1")),
+                         state['digest'])
 
     def test_file_dep_up_to_date(self):
         my_task = Task("t2", [""], file_dep=['tests/data/dependency1'])
